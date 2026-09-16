@@ -162,6 +162,7 @@ public:
 	virtual bool has_focus() const override { return bool(m_focus_window); }
 	void release_keys();
 	bool should_hide_mouse();
+	bool alt_held() const { return m_alt_held; }
 	void process_events_buf();
 
 	virtual sdl_options &options() override { return m_options; }
@@ -196,6 +197,7 @@ private:
 	sdl_options &m_options;
 	sdl_window_info *m_focus_window;
 	int m_mouse_over_window;
+	bool m_alt_held;
 	uint8_t m_modifier_keys;
 
 	std::chrono::steady_clock::time_point m_last_click_time;

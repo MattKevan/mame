@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <list>
 #include <memory>
 
@@ -284,8 +285,9 @@ void sdl_window_info::update_cursor_state()
 	if (!(machine().debug_flags & DEBUG_FLAG_OSD_ENABLED))
 	{
 		bool should_hide_mouse = downcast<sdl_osd_interface&>(machine().osd()).should_hide_mouse();
+		bool alt_released = downcast<sdl_osd_interface&>(machine().osd()).alt_held();
 
-		if (!fullscreen() && !should_hide_mouse)
+		if ((!fullscreen() && !should_hide_mouse) || alt_released)
 		{
 			show_pointer();
 			release_pointer();
@@ -296,7 +298,22 @@ void sdl_window_info::update_cursor_state()
 			capture_pointer();
 		}
 
-		SDL_SetCursor(nullptr); // Force an update in case the underlying driver has changed visibility
+		if (strncmp(machine().system().name, "datarover", 9) == 0)
+		{
+			static SDL_Cursor *s_stylus_cursor = nullptr;
+			if (!s_stylus_cursor)
+			{
+				static Uint8 const s_data[] = { 0x00, 0x70, 0x00, 0x70, 0x00, 0x70, 0x00, 0x70, 0x00, 0x70, 0x00, 0x00, 0xf8, 0x1f, 0x00, 0x00, 0xf8, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x70, 0x00, 0x70, 0x00, 0x70, 0x00, 0x70 };
+				static Uint8 const s_mask[] = { 0x00, 0x70, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0x70, 0xf8, 0x1f, 0xf8, 0x3e, 0xf8, 0x1f, 0xf8, 0x3e, 0x00, 0x70, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0x70 };
+				s_stylus_cursor = SDL_CreateCursor(const_cast<Uint8 *>(s_data), const_cast<Uint8 *>(s_mask), 16, 16, 7, 7);
+			}
+			if (s_stylus_cursor && !alt_released)
+				SDL_SetCursor(s_stylus_cursor);
+			else
+				SDL_SetCursor(nullptr); // Force an update in case the underlying driver has changed visibility
+		}
+		else
+			SDL_SetCursor(nullptr); // Force an update in case the underlying driver has changed visibility
 	}
 #endif
 }

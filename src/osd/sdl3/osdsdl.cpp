@@ -184,6 +184,7 @@ sdl_osd_interface::sdl_osd_interface(sdl_options &options) :
 	m_options(options),
 	m_focus_window(nullptr),
 	m_mouse_over_window(0),
+	m_alt_held(false),
 	m_modifier_keys(0),
 	m_last_click_time(std::chrono::steady_clock::time_point::min()),
 	m_last_click_x(0),
@@ -545,6 +546,8 @@ void sdl_osd_interface::process_events()
 					m_modifier_keys |= MODIFIER_KEY_LSHIFT;
 				else if (event.key.scancode == SDL_SCANCODE_RSHIFT)
 					m_modifier_keys |= MODIFIER_KEY_RSHIFT;
+				else if (event.key.scancode == SDL_SCANCODE_LALT)
+					m_alt_held = true;
 
 				if (event.key.key < 0x20)
 				{
@@ -580,6 +583,8 @@ void sdl_osd_interface::process_events()
 				m_modifier_keys &= ~MODIFIER_KEY_LSHIFT;
 			else if (event.key.scancode == SDL_SCANCODE_RSHIFT)
 				m_modifier_keys &= ~MODIFIER_KEY_RSHIFT;
+			else if (event.key.scancode == SDL_SCANCODE_LALT)
+				m_alt_held = false;
 			break;
 
 		case SDL_EVENT_TEXT_INPUT:
