@@ -31,6 +31,7 @@ extern "C" void datarover_install_menu(void);
 @interface DataRoverMenuHandler : NSObject
 - (void)resetMachine:(id)sender;
 - (void)freshBoot:(id)sender;
+- (void)closeWindow:(id)sender;
 - (void)selectLCD:(id)sender;
 - (void)selectSerial:(id)sender;
 - (void)selectBoth:(id)sender;
@@ -85,8 +86,14 @@ sdl_window_info *first_live_window(running_machine &machine)
 	(void)sender;
 	if (running_machine *machine = current_machine())
 	{
-		// Wipe this system's NVRAM files (battery-backed DRAM image) so the
-		// next boot follows the cold-start path, then hard-reset.
+		// Fresh Boot = cold start: reset all NVRAM devices to defaults
+		// in memory (device_nvram_interface::nvram_reset, the same call
+		// running_machine::nvram_load uses on a file miss) so the
+		// machine-run exit phase persists defaults instead of the live
+		// heap, delete the on-disk files so the next process starts
+		// clean, then hard-reset.
+		for (device_nvram_interface &nvram : nvram_interface_enumerator(machine->root_device()))
+			nvram.nvram_reset();
 		NSString *nvdir = [NSString stringWithUTF8String:machine->options().nvram_directory()];
 		NSString *base = [NSString stringWithUTF8String:machine->basename().c_str()];
 		if ((nvdir != nil) && (base != nil))
@@ -95,13 +102,16 @@ sdl_window_info *first_live_window(running_machine &machine)
 			NSFileManager *fm = [NSFileManager defaultManager];
 			NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:sysdir error:nil];
 			for (NSString *file in files)
-			{
-				if ([[file pathExtension] isEqualToString:@"nv"])
-					[fm removeItemAtPath:[sysdir stringByAppendingPathComponent:file] error:nil];
-			}
+				[fm removeItemAtPath:[sysdir stringByAppendingPathComponent:file] error:nil];
 		}
 		machine->schedule_hard_reset();
 	}
+}
+
+- (void)closeWindow:(id)sender
+{
+	(void)sender;
+	[[NSApp keyWindow] performClose:sender];
 }
 
 - (void)selectLCD:(id)sender
@@ -219,11 +229,11 @@ extern "C" void datarover_install_menu(void)
 		NSMenuItem *quit = menu_entry(@"Quit DataRover 840", @"q", @selector(terminate:));
 		[quit setTarget:nil];
 		[appMenu addItem:quit];
-		install_submenu(bar, @"DataRover", appMenu);
 
 		NSMenu *fileMenu = [[[NSMenu alloc] initWithTitle:@"File"] autorelease];
 		[fileMenu addItem:menu_entry(@"Reset Machine", @"r", @selector(resetMachine:))];
 		[fileMenu addItem:menu_entry(@"Fresh Boot", @"", @selector(freshBoot:))];
+		[fileMenu addItem:menu_entry(@"Close", @"w", @selector(closeWindow:))];
 		install_submenu(bar, @"File", fileMenu);
 
 		NSMenu *viewMenu = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
