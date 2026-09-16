@@ -37,6 +37,10 @@ public:
 
 	virtual void menu_reset() { }
 
+	// request the main menu; base default is a no-op so OSD code can call
+	// through machine().ui() without depending on frontend headers
+	virtual void show_main_menu() { }
+
 	virtual bool set_ui_event_handler(std::function<bool ()> &&handler) { return false; }
 
 	template <typename Format, typename... Params> void popup_time(int seconds, Format &&fmt, Params &&... args);

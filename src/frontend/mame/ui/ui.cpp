@@ -2806,6 +2806,11 @@ void mame_ui_manager::menu_reset()
 	ui::menu::stack_reset(*this);
 }
 
+void mame_ui_manager::show_main_menu()
+{
+	show_menu(current_ui_target());
+}
+
 
 bool mame_ui_manager::set_ui_event_handler(std::function<bool ()> &&handler)
 {

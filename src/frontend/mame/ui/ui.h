@@ -263,6 +263,7 @@ public:
 	virtual void popup_time_string(int seconds, std::string message) override;
 
 	virtual void menu_reset() override;
+	virtual void show_main_menu() override;
 	virtual bool set_ui_event_handler(std::function<bool ()> &&handler) override;
 
 	template <typename Owner, typename Data, typename... Param>

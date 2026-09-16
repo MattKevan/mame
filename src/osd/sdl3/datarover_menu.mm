@@ -84,7 +84,24 @@ sdl_window_info *first_live_window(running_machine &machine)
 {
 	(void)sender;
 	if (running_machine *machine = current_machine())
+	{
+		// Wipe this system's NVRAM files (battery-backed DRAM image) so the
+		// next boot follows the cold-start path, then hard-reset.
+		NSString *nvdir = [NSString stringWithUTF8String:machine->options().nvram_directory()];
+		NSString *base = [NSString stringWithUTF8String:machine->basename().c_str()];
+		if ((nvdir != nil) && (base != nil))
+		{
+			NSString *sysdir = [nvdir stringByAppendingPathComponent:base];
+			NSFileManager *fm = [NSFileManager defaultManager];
+			NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:sysdir error:nil];
+			for (NSString *file in files)
+			{
+				if ([[file pathExtension] isEqualToString:@"nv"])
+					[fm removeItemAtPath:[sysdir stringByAppendingPathComponent:file] error:nil];
+			}
+		}
 		machine->schedule_hard_reset();
+	}
 }
 
 - (void)selectLCD:(id)sender
@@ -157,9 +174,8 @@ sdl_window_info *first_live_window(running_machine &machine)
 		ui_manager &ui = machine->ui();
 		if (ui.is_menu_active())
 			ui.menu_reset();
-		// else: no documented base-class entry point opens the MAME menu;
-		// mame_ui_manager::show_menu() lives in frontend headers outside the
-		// OSD include path, so showing is intentionally left unwired.
+		else
+			ui.show_main_menu();
 	}
 }
 
