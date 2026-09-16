@@ -51,6 +51,7 @@
 #include "../osd/modules/lib/osdlib.h"
 #include "../osd/modules/lib/osdobj_common.h"
 
+#include <cstring>
 #include <functional>
 #include <type_traits>
 
@@ -754,7 +755,9 @@ void mame_ui_manager::display_startup_screens(bool first_time)
 		case 1:
 			if (show_warnings)
 			{
-				bool need_warning = machine_info().has_warnings();
+				// DataRover: imperfect timing is a known constant; skip straight to the system.
+				bool const is_datarover = std::strncmp(machine().system().name, "datarover", 9) == 0;
+				bool need_warning = machine_info().has_warnings() && (!is_datarover || machine_info().has_severe_warnings());
 				if (machine_info().has_severe_warnings() || !machine_info().has_warnings())
 				{
 					// critical warnings - no need to persist stuff
