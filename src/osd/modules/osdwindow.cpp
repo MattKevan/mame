@@ -9,6 +9,8 @@
 #include "emu.h"
 #include "osdwindow.h"
 
+#include <cstring>
+
 // osd/modules
 #include "lib/osdobj_common.h"
 #include "monitor/monitor_module.h"
@@ -36,7 +38,14 @@ osd_window::osd_window(
 	m_monitor(std::move(monitor)),
 	m_renderer(nullptr),
 	m_title(
-			util::string_format(
+			(strncmp(machine.system().name, "datarover", 9) == 0)
+				? util::string_format(
+					(video_config.numscreens > 1)
+						? "DataRover 840 screen %1$d - %2$s"
+						: "DataRover 840 - %2$s",
+					index,
+					machine.system().type.fullname())
+				: util::string_format(
 				(video_config.numscreens > 1)
 					? "%3$s [%4$s] screen %5$d - %1$s %2$s (%6$s%7$sP%8$d)"
 					: "%3$s [%4$s] - %1$s %2$s (%6$s%7$sP%8$d)",
