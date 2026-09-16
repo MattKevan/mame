@@ -18,6 +18,10 @@
 
 #include "ui/uimain.h"
 
+#if defined(SDLMAME_MACOSX)
+extern "C" void datarover_install_menu(void);
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -327,6 +331,10 @@ void sdl_osd_interface::init(running_machine &machine)
 		using namespace std::placeholders;
 		machine.add_logerror_callback(std::bind(&sdl_osd_interface::output_oslog, this, _1));
 	}
+
+#if defined(SDLMAME_MACOSX)
+	datarover_install_menu();
+#endif
 
 
 

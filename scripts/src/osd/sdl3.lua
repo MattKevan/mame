@@ -358,6 +358,7 @@ project ("osd_" .. _OPTIONS["osd"])
 
 	if _OPTIONS["targetos"]=="macosx" then
 		files {
+			MAME_DIR .. "src/osd/sdl3/datarover_menu.mm",
 			MAME_DIR .. "src/osd/modules/debugger/debugosx.mm",
 			MAME_DIR .. "src/osd/modules/debugger/osx/breakpointsview.mm",
 			MAME_DIR .. "src/osd/modules/debugger/osx/breakpointsview.h",
