@@ -229,6 +229,7 @@ extern "C" void datarover_install_menu(void)
 		NSMenuItem *quit = menu_entry(@"Quit DataRover 840", @"q", @selector(terminate:));
 		[quit setTarget:nil];
 		[appMenu addItem:quit];
+		install_submenu(bar, @"DataRover", appMenu);
 
 		NSMenu *fileMenu = [[[NSMenu alloc] initWithTitle:@"File"] autorelease];
 		[fileMenu addItem:menu_entry(@"Reset Machine", @"r", @selector(resetMachine:))];
