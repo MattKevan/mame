@@ -402,20 +402,31 @@ project ("osd_" .. _OPTIONS["osd"])
 		}
 	end
 
-	files {
-		MAME_DIR .. "src/osd/osdepend.h",
-		MAME_DIR .. "src/osd/modules/osdwindow.cpp",
-		MAME_DIR .. "src/osd/modules/osdwindow.h",
-		MAME_DIR .. "src/osd/sdl3/osdsdl.cpp",
-		MAME_DIR .. "src/osd/sdl3/osdsdl.h",
-		MAME_DIR .. "src/osd/sdl3/sdlmain.cpp",
-		MAME_DIR .. "src/osd/sdl3/sdlopts.cpp",
-		MAME_DIR .. "src/osd/sdl3/sdlopts.h",
-		MAME_DIR .. "src/osd/sdl3/sdlprefix.h",
-		MAME_DIR .. "src/osd/sdl3/video.cpp",
-		MAME_DIR .. "src/osd/sdl3/window.cpp",
-		MAME_DIR .. "src/osd/sdl3/window.h",
-	}
+-- DataRover shared core: framebuffer tap + lifecycle/pen/package ABI.
+-- Compiled into the osd_sdl3 archive alongside the OSD (same pattern as
+-- the mac-only datarover_menu.mm entry above); the shim entry points are
+-- only referenced for the datarover driver, so other builds link unchanged.
+files {
+	MAME_DIR .. "src/libdatarover/datarover_core.cpp",
+	MAME_DIR .. "src/libdatarover/datarover_core.h",
+	MAME_DIR .. "src/libdatarover/datarover_shim.cpp",
+	MAME_DIR .. "src/libdatarover/datarover_shim.h",
+}
+
+files {
+	MAME_DIR .. "src/osd/osdepend.h",
+	MAME_DIR .. "src/osd/modules/osdwindow.cpp",
+	MAME_DIR .. "src/osd/modules/osdwindow.h",
+	MAME_DIR .. "src/osd/sdl3/osdsdl.cpp",
+	MAME_DIR .. "src/osd/sdl3/osdsdl.h",
+	MAME_DIR .. "src/osd/sdl3/sdlmain.cpp",
+	MAME_DIR .. "src/osd/sdl3/sdlopts.cpp",
+	MAME_DIR .. "src/osd/sdl3/sdlopts.h",
+	MAME_DIR .. "src/osd/sdl3/sdlprefix.h",
+	MAME_DIR .. "src/osd/sdl3/video.cpp",
+	MAME_DIR .. "src/osd/sdl3/window.cpp",
+	MAME_DIR .. "src/osd/sdl3/window.h",
+}
 
 project ("ocore_" .. _OPTIONS["osd"])
 	uuid (os.uuid("ocore_" .. _OPTIONS["osd"]))

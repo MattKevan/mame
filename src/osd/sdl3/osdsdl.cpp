@@ -18,6 +18,8 @@
 
 #include "ui/uimain.h"
 
+#include "../../libdatarover/datarover_shim.h"
+
 #if defined(SDLMAME_MACOSX)
 extern "C" void datarover_install_menu(void);
 #endif
@@ -336,6 +338,9 @@ void sdl_osd_interface::init(running_machine &machine)
 #if defined(SDLMAME_MACOSX)
 	datarover_install_menu();
 #endif
+	// libdatarover parity gate: arm the in-process framebuffer dump when
+	// DATAROVER_CORE_DUMP is set (no-op otherwise; datarover driver only).
+	datarover_shim_osd_init();
 
 
 

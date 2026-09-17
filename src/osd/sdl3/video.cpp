@@ -22,6 +22,7 @@
 #include "main.h"
 #include "rendutil.h"
 #include "uiinput.h"
+#include "../../libdatarover/datarover_shim.h"
 
 #if defined(SDLMAME_MACOSX)
 extern "C" void datarover_install_menu(void);
@@ -110,6 +111,10 @@ void sdl_osd_interface::video_exit()
 void sdl_osd_interface::update(bool skip_redraw)
 {
 	osd_common_t::update(skip_redraw);
+	// libdatarover parity gate: per-emulated-frame hook for the datarover
+	// driver only (no-op unless DATAROVER_CORE_DUMP is set). Runs at the
+	// video_manager::frame_update point that also fires Lua frame_done.
+	datarover_shim_frame_hook();
 
 	// if we're not skipping this redraw, update all windows
 	if (!skip_redraw)
