@@ -35,8 +35,8 @@ extern "C" void datarover_install_menu(void);
 - (void)selectLCD:(id)sender;
 - (void)selectSerial:(id)sender;
 - (void)selectBoth:(id)sender;
-- (void)cycleZoom:(id)sender;
-- (void)toggleFullscreen:(id)sender;
+- (void)setActualSize:(id)sender;
+- (void)setDoubleSize:(id)sender;
 - (void)toggleMameUI:(id)sender;
 @end
 
@@ -144,24 +144,37 @@ sdl_window_info *first_live_window(running_machine &machine)
 	}
 }
 
-- (void)cycleZoom:(id)sender
+- (void)setWindowScale:(int)scale
 {
-	(void)sender;
 	if (running_machine *machine = current_machine())
 		if (sdl_window_info *osdwin = first_live_window(*machine))
 		{
-			// Mirror IPT_OSD_6/IPT_OSD_7 (window prescale steppers):
-			// wrap from max back to 1x so a single item cycles.
-			if (osdwin->prescale() >= 20)
+			if (osdwin->fullscreen())
 			{
-				while (osdwin->prescale() > 1)
-					osdwin->modify_prescale(-1);
+				for (auto &curwin : osd_common_t::window_list())
+					curwin->renderer_reset();
+				osdwin->toggle_full_screen();
 			}
-			else
-			{
+			int32_t minwidth, minheight;
+			osdwin->target()->compute_minimum_size(minwidth, minheight);
+			while (osdwin->prescale() > scale)
+				osdwin->modify_prescale(-1);
+			while (osdwin->prescale() < scale)
 				osdwin->modify_prescale(1);
-			}
+			osdwin->resize(minwidth * scale, minheight * scale);
 		}
+}
+
+- (void)setActualSize:(id)sender
+{
+	(void)sender;
+	[self setWindowScale:1];
+}
+
+- (void)setDoubleSize:(id)sender
+{
+	(void)sender;
+	[self setWindowScale:2];
 }
 
 - (void)toggleFullscreen:(id)sender
@@ -228,7 +241,6 @@ extern "C" void datarover_install_menu(void)
 		[appMenu addItem:[NSMenuItem separatorItem]];
 		NSMenuItem *quit = menu_entry(@"Quit DataRover 840", @"q", @selector(terminate:));
 		[quit setTarget:nil];
-		[appMenu addItem:quit];
 		install_submenu(bar, @"DataRover", appMenu);
 
 		NSMenu *fileMenu = [[[NSMenu alloc] initWithTitle:@"File"] autorelease];
@@ -242,7 +254,8 @@ extern "C" void datarover_install_menu(void)
 		[viewMenu addItem:menu_entry(@"Serial Terminal", @"2", @selector(selectSerial:))];
 		[viewMenu addItem:menu_entry(@"LCD and Serial", @"3", @selector(selectBoth:))];
 		[viewMenu addItem:[NSMenuItem separatorItem]];
-		[viewMenu addItem:menu_entry(@"Zoom Cycle", @"0", @selector(cycleZoom:))];
+		[viewMenu addItem:menu_entry(@"Actual Size", @"0", @selector(setActualSize:))];
+		[viewMenu addItem:menu_entry(@"2x", @"", @selector(setDoubleSize:))];
 		[viewMenu addItem:menu_entry(@"Fullscreen", @"f", @selector(toggleFullscreen:))];
 		install_submenu(bar, @"View", viewMenu);
 
