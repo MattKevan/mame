@@ -404,8 +404,12 @@ project ("osd_" .. _OPTIONS["osd"])
 
 -- DataRover shared core: framebuffer tap + lifecycle/pen/package ABI.
 -- Compiled into the osd_sdl3 archive alongside the OSD (same pattern as
--- the mac-only datarover_menu.mm entry above); the shim entry points are
--- only referenced for the datarover driver, so other builds link unchanged.
+-- the mac-only datarover_menu.mm entry above). This home is UNCONDITIONAL:
+-- every SDL build links the core+shim objects (there is no per-SUBTARGET
+-- conditional in this file). That is deliberate and harmless: the shim
+-- entry points self-gate at runtime (no-op unless DATAROVER_CORE_DUMP is
+-- set, datarover driver only), and the plain SOURCES build was verified
+-- to relink and run unchanged.
 files {
 	MAME_DIR .. "src/libdatarover/datarover_core.cpp",
 	MAME_DIR .. "src/libdatarover/datarover_core.h",

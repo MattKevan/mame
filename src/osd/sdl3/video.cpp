@@ -114,7 +114,7 @@ void sdl_osd_interface::update(bool skip_redraw)
 	// libdatarover parity gate: per-emulated-frame hook for the datarover
 	// driver only (no-op unless DATAROVER_CORE_DUMP is set). Runs at the
 	// video_manager::frame_update point that also fires Lua frame_done.
-	datarover_shim_frame_hook();
+	datarover_shim_frame_hook(machine());
 
 	// if we're not skipping this redraw, update all windows
 	if (!skip_redraw)

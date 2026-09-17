@@ -340,7 +340,7 @@ void sdl_osd_interface::init(running_machine &machine)
 #endif
 	// libdatarover parity gate: arm the in-process framebuffer dump when
 	// DATAROVER_CORE_DUMP is set (no-op otherwise; datarover driver only).
-	datarover_shim_osd_init();
+	datarover_shim_osd_init(machine);
 
 
 
