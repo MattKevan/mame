@@ -84,7 +84,11 @@ int main(int argc, char** argv)
 	// Enable standard application logging
 	SDL_SetLogPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_VERBOSE);
 #endif
-
+#if defined(SDLMAME_MACOSX)
+	// The datarover SUBTARGET build is a single-system app; SDL derives the
+	// macOS menubar/Dock name from this when no bundle plist overrides it.
+	SDL_SetAppMetadata("DataRover", nullptr, nullptr);
+#endif
 #if defined(SDLMAME_MACOSX) && SDL_VERSION_ATLEAST(3, 4, 0)
 	// disable the popup accents menu on macOS
 	SDL_SetHint(SDL_HINT_MAC_PRESS_AND_HOLD, "false");

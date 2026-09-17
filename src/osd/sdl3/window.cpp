@@ -617,6 +617,26 @@ int sdl_window_info::window_init()
 	// FIXME: Does not belong here
 	m_startmaximized = downcast<sdl_options &>(machine().options()).maximize();
 
+	// DataRover: boot windowed at 2x actual size instead of maximized.
+	// The launcher always passes -window, so m_fullscreen is false here;
+	// m_startmaximized comes from the global maximize=1 default.
+	if (strncmp(machine().system().name, "datarover", 9) == 0)
+	{
+		m_startmaximized = 0;
+		m_prescale = 2;
+		create_target();
+		int32_t minwidth, minheight;
+		target()->compute_minimum_size(minwidth, minheight);
+		m_windowed_dim = osd_dim(minwidth * 2, minheight * 2);
+		int dtresult = complete_create();
+		if (dtresult == 1)
+		{
+			destroy();
+			return 1;
+		}
+		return 0;
+	}
+
 	create_target();
 
 	int result = complete_create();
