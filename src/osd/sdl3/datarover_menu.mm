@@ -31,6 +31,7 @@ extern "C" void datarover_install_menu(void);
 @interface DataRoverMenuHandler : NSObject
 - (void)resetMachine:(id)sender;
 - (void)freshBoot:(id)sender;
+- (void)installPackage:(id)sender;
 - (void)closeWindow:(id)sender;
 - (void)selectLCD:(id)sender;
 - (void)selectSerial:(id)sender;
@@ -38,9 +39,18 @@ extern "C" void datarover_install_menu(void);
 - (void)setActualSize:(id)sender;
 - (void)setDoubleSize:(id)sender;
 - (void)toggleMameUI:(id)sender;
+- (void)pressPower:(id)sender;
+- (void)pressOption:(id)sender;
+- (void)releasePendingButton:(id)sender;
 @end
 
 namespace {
+
+// Momentary button press state: the Device-menu release is deferred
+// ~150 ms so the per-frame ioport scan observes the pressed edge
+// before the release edge.
+static ioport_field *s_pending_release = nullptr;
+
 
 running_machine *current_machine()
 {
@@ -108,10 +118,123 @@ sdl_window_info *first_live_window(running_machine &machine)
 	}
 }
 
-- (void)closeWindow:(id)sender
+- (void)installPackage:(id)sender
 {
 	(void)sender;
-	[[NSApp keyWindow] performClose:sender];
+	running_machine *machine = current_machine();
+	if (!machine)
+		return;
+	// PTY discovery: DATAROVER_PCLINK_PTY written by the launcher at
+	// startup.  The handler cannot read launcher stdout (where MAME
+	// announces ":rs2321:pty PTY: <path>"), and walking
+	// machine.root_device() for the "pty" rs232 option device plus
+	// device_pty_interface::slave_name() is fragile from ObjC++, so the
+	// env var is the injection point.
+	const char *pty = getenv("DATAROVER_PCLINK_PTY");
+	if (!pty || !*pty)
+	{
+		machine->ui().popup_time(5, "PCLink serial port not available");
+		return;
+	}
+	NSOpenPanel *panel = [NSOpenPanel openPanel];
+	[panel setCanChooseFiles:YES];
+	[panel setCanChooseDirectories:NO];
+	[panel setAllowsMultipleSelection:NO];
+	[panel setAllowedFileTypes:@[@"pkg"]];
+	NSString *pkgdir = [NSHomeDirectory() stringByAppendingPathComponent:
+		@"Library/Application Support/DataRover/packages"];
+	[[NSFileManager defaultManager] createDirectoryAtPath:pkgdir
+		withIntermediateDirectories:YES attributes:nil error:nil];
+	[panel setDirectoryURL:[NSURL fileURLWithPath:pkgdir]];
+	if ([panel runModal] != NSModalResponseOK)
+		return;
+	NSString *path = [[panel URL] path];
+	if (!path)
+		return;
+	// pclink_send.py location: repo tools/ path.  The emulator checkout
+	// (magic-cap-emulator) ships tools/pclink_send.py next to the MAME
+	// fork; the .app bundle does not embed Resources for helper scripts
+	// yet, so resolve relative to $MAGIC_CAP_EMULATOR_ROOT, falling back
+	// to the fork-adjacent ../magic-cap-emulator checkout layout.
+	const char *root = getenv("MAGIC_CAP_EMULATOR_ROOT");
+	NSString *script = nil;
+	if (root && *root)
+		script = [NSString stringWithFormat:@"%s/tools/pclink_send.py", root];
+	else
+		script = [[[NSBundle mainBundle] bundlePath]
+			stringByAppendingPathComponent:@"../../../magic-cap-emulator/tools/pclink_send.py"];
+	script = [script stringByStandardizingPath];
+	if (![[NSFileManager defaultManager] isExecutableFileAtPath:@"/usr/bin/python3"] ||
+		![[NSFileManager defaultManager] fileExistsAtPath:script])
+	{
+		machine->ui().popup_time(5, "pclink_send.py not found");
+		return;
+	}
+	NSTask *task = [[[NSTask alloc] init] autorelease];
+	[task setLaunchPath:@"/usr/bin/python3"];
+	[task setArguments:@[script, @"--pty", [NSString stringWithUTF8String:pty],
+		@"--package", path]];
+	@try
+	{
+		[task launch];
+	}
+	@catch (NSException *e)
+	{
+		(void)e;
+		machine->ui().popup_time(5, "Could not start package install");
+	}
+}
+
+- (void)closeWindow:(id)sender
+ {
+ 	(void)sender;
+ 	[[NSApp keyWindow] performClose:sender];
+ }
+
+// Momentary button press: drive the same IPT_OTHER port the keyboard
+// binding feeds (root_device().ioport(tag)->field(mask)), via the
+// ioport_field::set_value/clear_value injection point used by the
+// on-screen clickable layout views (render.cpp).  The frame_update
+// changed-callback then fires power_changed/option_changed exactly as a
+// physical key press would.
+- (void)releasePendingButton:(id)sender
+{
+	(void)sender;
+	if (s_pending_release)
+	{
+		s_pending_release->clear_value();
+		s_pending_release = nullptr;
+	}
+}
+
+- (void)pulsePort:(const char *)tag
+{
+	if (running_machine *machine = current_machine())
+	{
+		[self releasePendingButton:nil];
+		ioport_port *port = machine->root_device().ioport(tag);
+		if (port)
+		{
+			if (ioport_field *field = port->field(0x01))
+			{
+				field->set_value(1);
+				s_pending_release = field;
+				[self performSelector:@selector(releasePendingButton:)
+					withObject:nil afterDelay:0.15];
+			}
+		}
+	}
+}
+- (void)pressPower:(id)sender
+{
+	(void)sender;
+	[self pulsePort:"POWER_BUTTON"];
+}
+
+- (void)pressOption:(id)sender
+{
+	(void)sender;
+	[self pulsePort:"OPTION_BUTTON"];
 }
 
 - (void)selectLCD:(id)sender
@@ -243,11 +366,12 @@ extern "C" void datarover_install_menu(void)
 		[quit setTarget:nil];
 		install_submenu(bar, @"DataRover", appMenu);
 
-		NSMenu *fileMenu = [[[NSMenu alloc] initWithTitle:@"File"] autorelease];
-		[fileMenu addItem:menu_entry(@"Reset Machine", @"r", @selector(resetMachine:))];
-		[fileMenu addItem:menu_entry(@"Fresh Boot", @"", @selector(freshBoot:))];
-		[fileMenu addItem:menu_entry(@"Close", @"w", @selector(closeWindow:))];
-		install_submenu(bar, @"File", fileMenu);
+	NSMenu *fileMenu = [[[NSMenu alloc] initWithTitle:@"File"] autorelease];
+	[fileMenu addItem:menu_entry(@"Reset Machine", @"r", @selector(resetMachine:))];
+	[fileMenu addItem:menu_entry(@"Fresh Boot", @"", @selector(freshBoot:))];
+	[fileMenu addItem:menu_entry(@"Install Package…", @"i", @selector(installPackage:))];
+	[fileMenu addItem:menu_entry(@"Close", @"w", @selector(closeWindow:))];
+	install_submenu(bar, @"File", fileMenu);
 
 		NSMenu *viewMenu = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
 		[viewMenu addItem:menu_entry(@"LCD", @"1", @selector(selectLCD:))];
@@ -264,7 +388,12 @@ extern "C" void datarover_install_menu(void)
 		NSMenuItem *minimize = [[[NSMenuItem alloc] initWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"] autorelease];
 		[minimize setTarget:nil];
 		[windowMenu addItem:minimize];
-		install_submenu(bar, @"Window", windowMenu);
+	install_submenu(bar, @"Window", windowMenu);
+
+	NSMenu *deviceMenu = [[[NSMenu alloc] initWithTitle:@"Device"] autorelease];
+	[deviceMenu addItem:menu_entry(@"Power", @"p", @selector(pressPower:))];
+	[deviceMenu addItem:menu_entry(@"Option Button", @"", @selector(pressOption:))];
+	install_submenu(bar, @"Device", deviceMenu);
 
 		[NSApp setMainMenu:bar];
 	}

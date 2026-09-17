@@ -162,7 +162,7 @@ public:
 	virtual bool has_focus() const override { return bool(m_focus_window); }
 	void release_keys();
 	bool should_hide_mouse();
-	bool alt_held() const { return m_alt_held; }
+	bool alt_held() const { return m_alt_held; } // tracks Right Alt; Left Alt is the Option button key
 	void process_events_buf();
 
 	virtual sdl_options &options() override { return m_options; }

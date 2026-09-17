@@ -546,7 +546,9 @@ void sdl_osd_interface::process_events()
 					m_modifier_keys |= MODIFIER_KEY_LSHIFT;
 				else if (event.key.scancode == SDL_SCANCODE_RSHIFT)
 					m_modifier_keys |= MODIFIER_KEY_RSHIFT;
-				else if (event.key.scancode == SDL_SCANCODE_LALT)
+				// Right Alt releases the pointer (window.cpp alt_held);
+				// Left Alt stays the DataRover Option button key.
+				else if (event.key.scancode == SDL_SCANCODE_RALT)
 					m_alt_held = true;
 
 				if (event.key.key < 0x20)
@@ -583,7 +585,7 @@ void sdl_osd_interface::process_events()
 				m_modifier_keys &= ~MODIFIER_KEY_LSHIFT;
 			else if (event.key.scancode == SDL_SCANCODE_RSHIFT)
 				m_modifier_keys &= ~MODIFIER_KEY_RSHIFT;
-			else if (event.key.scancode == SDL_SCANCODE_LALT)
+			else if (event.key.scancode == SDL_SCANCODE_RALT)
 				m_alt_held = false;
 			break;
 
