@@ -1,14 +1,79 @@
-// datarover_core.cpp — framebuffer tap for libdatarover (Task 1).
+// datarover_core.cpp — libdatarover core: framebuffer tap + lifecycle/pen/package.
 //
 // Scanout source: datarover_state::screen_update
 // (src/mame/skeleton/datarover.cpp). The LCD panel is the "screen" device tag;
 // scanout reads 2bpp pixels from guest DRAM at the Dino video-high-buffer
 // base register (Dino MMIO 0x10c00000 + 0x030, masked to 0xfffffff0) with
 // fallback base 0x003f6a00 when out of the 4 MiB DRAM window.
+//
+// Lifecycle mirrors the cli_frontend boot path (src/frontend/mame/clifront.cpp:
+// start_execution) minus the CLI: select datarover840 by name, configure
+// nvram/cfg/rom paths, build machine_config, run running_machine::run() on a
+// worker thread (mame_machine_manager::execute() at src/frontend/mame/mame.cpp:235
+// blocks — hence the thread). The manager is the real mame_machine_manager
+// singleton, not a minimal subclass: the core video frame path calls
+// emulator_info::draw_user_interface/periodic_check/frame_hook, which dereference
+// mame_machine_manager::instance(), and running_machine::run() needs
+// manager->http() non-null plus a real ui_manager from create_ui — a bare
+// machine_manager base would null-deref in all three places. Plugins/Lua stay
+// off via options; NVRAM save stays on so guest state persists across boots.
+// Teardown is schedule_exit + join + manager delete. One live handle per
+// process (the manager singleton binds one options set; a second concurrent
+// create returns NULL).
+//
+// Pen injects into TOUCH_X/TOUCH_Y/TOUCH_BUTTON (datarover.cpp:4672-4679,
+// IPT_LIGHTGUN_X/Y + IPT_BUTTON1) via ioport_field::set_value — the same
+// injection point as the menu pulsePort (src/osd/sdl3/datarover_menu.mm) and
+// the clickable views (src/emu/render.cpp:1317-1320).
+//
+// Package install ports the Python PCLink codec (tools/pclink_send.py:
+// escape/CRC/packet/metadata) to C++ and writes the encoded wire to the
+// guest's UART-A/RS-232 endpoint in-process via the rs2321 PTY card's slave
+// side (docs/pclink.md: Storeroom computer over Dino UART A 19200 8N1,
+// exposed as MAME RS-232 port 1; harness uses -rs2321 pty).
+//
+// Threading contract: the emulation thread owns running_machine, options, OSD
+// and ioport state. Pen/package entry points run on the caller thread and only
+// touch the machine through the atomic pointer plus ioport set_value (plain
+// override writes the ADC path samples next frame) or PTY slave writes
+// (kernel-buffered, consumed by the emulation thread's poll timer) — the same
+// split as the Lua set_value automation and pulsePort. destroy() only signals
+// schedule_exit and joins. Framebuffer bytes may be read from any thread while
+// alive; the pointer is core-owned, valid until destroy returns.
 
 #include "libdatarover/datarover_core.h"
 
 #include "emu.h"
+
+#include "osdepend.h"
+#include "main.h"
+#include "frontend/mame/mame.h"
+#include "emuopts.h"
+#include "modules/lib/osdobj_common.h"
+#include "drivenum.h"
+#include "gamedrv.h"
+#include "mconfig.h"
+#include "ioport.h"
+#include "dipty.h"
+#include "dislot.h"
+#include "frontend/mame/ui/menuitem.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <fcntl.h>
+#include <memory>
+#include <mutex>
+#include <poll.h>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+GAME_EXTERN(datarover840);
 
 namespace {
 
@@ -16,6 +81,353 @@ constexpr uint32_t DINO_MMIO_BASE = 0x10c00000U;
 constexpr uint32_t DINO_VIDEO_HIGH_BUFFER_OFF = 0x030U;
 constexpr uint32_t FALLBACK_BASE = 0x003f6a00U;
 constexpr uint32_t DRAM_LIMIT = 0x00400000U;
+
+// --- PCLink wire codec: C++ port of tools/pclink_send.py --------------------
+// escape set exactly {0x0E,0x0F,0x10}, introducer 0x10, before framing (a pair
+// may straddle a 256-byte boundary). Frames: raw BE u16 len + escaped bytes +
+// raw BE u32 ~crc32(frame). Packet: CRC stream of (tag[4] + BE u32 len +
+// payload). SPkg metadata: 0x404-byte WinPCLink layout (u32be size twice @0,
+// 0x80000000 @24, filename char count @28, UTF-16BE name @32). Package stream:
+// raw package + four NUL bytes as its own CRC stream (docs/pclink.md).
+// CRC-32 is the zlib/IEEE polynomial (init/xorout 0xFFFFFFFF), implemented
+// table-driven here so the core links nothing extra; it matches Python
+// zlib.crc32 (0xCBF43926 for "123456789") and therefore the ~crc32 framing
+// the unit tests pin in tests/test_pclink_regression.py.
+
+uint32_t pclink_crc32(const uint8_t *data, size_t len)
+{
+	static uint32_t table[256];
+	static const bool init = []()
+	{
+		for (uint32_t i = 0; i < 256; ++i)
+		{
+			uint32_t c = i;
+			for (int k = 0; k < 8; ++k)
+				c = (c & 1) ? (c >> 1) ^ 0xEDB88320U : (c >> 1);
+			table[i] = c;
+		}
+		return true;
+	}();
+	(void)init;
+	uint32_t crc = 0xFFFFFFFFU;
+	for (size_t i = 0; i < len; ++i)
+		crc = table[(crc ^ data[i]) & 0xFFU] ^ (crc >> 8);
+	return crc ^ 0xFFFFFFFFU;
+}
+
+void pclink_put_be16(std::vector<uint8_t> &out, uint32_t v)
+{
+	out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+	out.push_back(static_cast<uint8_t>(v & 0xff));
+}
+
+void pclink_put_be32(std::vector<uint8_t> &out, uint32_t v)
+{
+	out.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+	out.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
+	out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+	out.push_back(static_cast<uint8_t>(v & 0xff));
+}
+
+std::vector<uint8_t> pclink_encode_crc_stream(const uint8_t *data, size_t len)
+{
+	std::vector<uint8_t> escaped;
+	escaped.reserve(len + len / 64 + 1);
+	for (size_t i = 0; i < len; ++i)
+	{
+		const uint8_t v = data[i];
+		if (v == 0x0e || v == 0x0f || v == 0x10)
+			escaped.push_back(0x10);
+		escaped.push_back(v);
+	}
+	std::vector<uint8_t> wire;
+	wire.reserve(escaped.size() + (escaped.size() / 256 + 1) * 6);
+	for (size_t start = 0; start < escaped.size(); start += 256)
+	{
+		const size_t n = std::min<size_t>(256, escaped.size() - start);
+		pclink_put_be16(wire, static_cast<uint32_t>(n));
+		wire.insert(wire.end(), escaped.begin() + start, escaped.begin() + start + n);
+		pclink_put_be32(wire, ~pclink_crc32(escaped.data() + start, n));
+	}
+	return wire;
+}
+
+std::vector<uint8_t> pclink_encode_packet(const char tag[4], const uint8_t *payload, size_t payload_len)
+{
+	std::vector<uint8_t> raw;
+	raw.reserve(8 + payload_len);
+	for (int i = 0; i < 4; ++i)
+		raw.push_back(static_cast<uint8_t>(tag[i]));
+	pclink_put_be32(raw, static_cast<uint32_t>(payload_len));
+	raw.insert(raw.end(), payload, payload + payload_len);
+	return pclink_encode_crc_stream(raw.data(), raw.size());
+}
+
+std::vector<uint8_t> pclink_package_metadata(uint32_t size, const std::string &name)
+{
+	std::vector<uint8_t> meta(0x404, 0);
+	auto put32 = [&meta](size_t off, uint32_t v)
+	{
+		meta[off] = static_cast<uint8_t>((v >> 24) & 0xff);
+		meta[off + 1] = static_cast<uint8_t>((v >> 16) & 0xff);
+		meta[off + 2] = static_cast<uint8_t>((v >> 8) & 0xff);
+		meta[off + 3] = static_cast<uint8_t>(v & 0xff);
+	};
+	put32(0, size);
+	put32(4, size);
+	put32(24, 0x80000000U);
+	put32(28, static_cast<uint32_t>(name.size()));
+	size_t off = 32;
+	for (char c : name)
+	{
+		if (off + 1 >= meta.size())
+			break;
+		meta[off++] = 0x00;
+		meta[off++] = static_cast<uint8_t>(c);
+	}
+	return meta;
+}
+
+// --- Headless OSD stub ------------------------------------------------------
+// Why a stub instead of sdl_osd_interface with -video none:
+// sdl init calls SDL_InitSubSystem(SDL_INIT_VIDEO) and video_init() creates a
+// real SDL window per numscreens even with -video none (only the Windows OSD
+// skips positioning for a non-interactive renderer). A headless library cannot
+// do that. This stub satisfies the osd_interface contract the core uses while
+// creating no windows: no window list, update() renders nothing, and the guest
+// advances via the normal scheduler timeslice in machine.run(). Sound "none"
+// semantics (no_sound() true) match -sound none; everything else is a null
+// sink like the modules/* none providers.
+
+class core_headless_osd : public osd_interface
+{
+public:
+	core_headless_osd() = default;
+
+	void init(running_machine &machine) override
+	{
+		m_machine = &machine;
+		machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&core_headless_osd::on_exit, this));
+	}
+	void update(bool skip_redraw) override { (void)skip_redraw; }
+	void input_update(bool relative_reset) override { (void)relative_reset; }
+	void check_osd_inputs() override { }
+	void set_verbose(bool print_verbose) override { m_verbose = print_verbose; }
+
+	void init_debugger() override { }
+	void wait_for_debugger(device_t &device, bool firststop) override
+	{
+		(void)device;
+		(void)firststop;
+	}
+
+	bool no_sound() override { return true; }
+	bool sound_external_per_channel_volume() override { return false; }
+	bool sound_split_streams_per_source() override { return false; }
+	uint32_t sound_get_generation() override { return 1; }
+	osd::audio_info sound_get_information() override
+	{
+		osd::audio_info info;
+		info.m_generation = 1;
+		info.m_default_sink = 0;
+		info.m_default_source = 0;
+		return info;
+	}
+	uint32_t sound_stream_sink_open(uint32_t node, std::string name, uint32_t rate) override
+	{
+		(void)node;
+		(void)name;
+		(void)rate;
+		return 0;
+	}
+	uint32_t sound_stream_source_open(uint32_t node, std::string name, uint32_t rate) override
+	{
+		(void)node;
+		(void)name;
+		(void)rate;
+		return 0;
+	}
+	void sound_stream_close(uint32_t id) override { (void)id; }
+	void sound_stream_sink_update(uint32_t id, const int16_t *buffer, int samples_this_frame) override
+	{
+		(void)id;
+		(void)buffer;
+		(void)samples_this_frame;
+	}
+	void sound_stream_source_update(uint32_t id, int16_t *buffer, int samples_this_frame) override
+	{
+		(void)id;
+		(void)buffer;
+		(void)samples_this_frame;
+	}
+	void sound_stream_set_volumes(uint32_t id, const std::vector<float> &db) override
+	{
+		(void)id;
+		(void)db;
+	}
+	void sound_begin_update() override { }
+	void sound_end_update() override { }
+
+	void customize_input_type_list(std::vector<input_type_entry> &typelist) override { (void)typelist; }
+
+	void add_audio_to_recording(const int16_t *buffer, int samples_this_frame) override
+	{
+		(void)buffer;
+		(void)samples_this_frame;
+	}
+	std::vector<ui::menu_item> get_slider_list() override { return std::vector<ui::menu_item>(); }
+
+	osd_font::ptr font_alloc() override { return nullptr; }
+	bool get_font_families(std::string const &font_path, std::vector<std::pair<std::string, std::string> > &result) override
+	{
+		(void)font_path;
+		(void)result;
+		return false;
+	}
+
+	bool execute_command(const char *command) override
+	{
+		(void)command;
+		return false;
+	}
+
+	std::unique_ptr<osd::midi_input_port> create_midi_input(std::string_view name) override
+	{
+		(void)name;
+		return nullptr;
+	}
+	std::unique_ptr<osd::midi_output_port> create_midi_output(std::string_view name) override
+	{
+		(void)name;
+		return nullptr;
+	}
+	std::vector<osd::midi_port_info> list_midi_ports() override
+	{
+		return std::vector<osd::midi_port_info>();
+	}
+
+	std::unique_ptr<osd::network_device> open_network_device(int id, osd::network_handler &handler) override
+	{
+		(void)id;
+		(void)handler;
+		return nullptr;
+	}
+	std::vector<osd::network_device_info> list_network_devices() override
+	{
+		return std::vector<osd::network_device_info>();
+	}
+
+private:
+	void on_exit() { m_machine = nullptr; }
+
+	running_machine *m_machine = nullptr;
+	bool m_verbose = false;
+};
+
+struct datarover_core
+{
+	std::unique_ptr<osd_options> options;
+	std::unique_ptr<core_headless_osd> osd;
+	std::thread worker;
+	std::mutex mutex;
+	std::condition_variable ready_cv;
+	bool ready = false;
+	bool boot_failed = false;
+	std::atomic<running_machine *> machine{ nullptr };
+	int run_result = EMU_ERR_NONE;
+};
+
+// One live handle per process: mame_machine_manager::instance() binds a single
+// options set process-wide, so a second concurrent create must fail.
+std::atomic<datarover_core *> s_live{ nullptr };
+
+// Caller thread (same split as Lua automation / pulsePort): inject via
+// ioport_field::set_value. Guest coords scale to the PORT_MINMAX(0,0xffff)
+// axis exactly like the harness (floor(x * 0xffff / 479)). Analog set_value
+// latches the adjoverride the live read consults, so the value holds until
+// the next pen event — no per-frame refresh.
+void inject_pen(running_machine *m, int x, int y, bool button)
+{
+	if (!m)
+		return;
+	x = std::clamp(x, 0, DATAROVER_FB_WIDTH - 1);
+	y = std::clamp(y, 0, DATAROVER_FB_HEIGHT - 1);
+	device_t &root = m->root_device();
+	if (ioport_port *port = root.ioport("TOUCH_X"))
+		if (ioport_field *field = port->field(0xffff))
+			field->set_value(static_cast<ioport_value>((static_cast<uint32_t>(x) * 0xffffU) / 479U));
+	if (ioport_port *port = root.ioport("TOUCH_Y"))
+		if (ioport_field *field = port->field(0xffff))
+			field->set_value(static_cast<ioport_value>((static_cast<uint32_t>(y) * 0xffffU) / 319U));
+	if (ioport_port *port = root.ioport("TOUCH_BUTTON"))
+		if (ioport_field *field = port->field(0x01))
+		{
+			if (button)
+				field->set_value(1);
+			else
+				field->clear_value();
+		}
+}
+
+// Find the rs2321 PTY slave path through public device APIs only
+// (slot interface + PTY interface; no rs232 card headers needed).
+std::string pty_slave_path(running_machine *m)
+{
+	if (!m)
+		return std::string();
+	device_t *port = m->root_device().subdevice("rs2321");
+	if (!port)
+		return std::string();
+	device_slot_interface *slot = dynamic_cast<device_slot_interface *>(port);
+	if (!slot)
+		return std::string();
+	device_t *card = slot->get_card_device();
+	if (!card)
+		return std::string();
+	device_pty_interface *pty = dynamic_cast<device_pty_interface *>(card);
+	if (!pty || !pty->is_slave_connected())
+		return std::string();
+	return pty->slave_name();
+}
+
+// Bounded write: the emulation thread drains the PTY master continuously, so
+// this normally completes at once; the deadline only bites when the guest is
+// not listening (wrong screen), turning a hang into a reported failure.
+bool write_all_fd(int fd, const uint8_t *data, size_t len)
+{
+	size_t off = 0;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (off < len)
+	{
+		ssize_t n = ::write(fd, data + off, len - off);
+		if (n > 0)
+		{
+			off += static_cast<size_t>(n);
+			continue;
+		}
+		if (n < 0 && errno != EINTR && errno != EAGAIN)
+			return false;
+		if (std::chrono::steady_clock::now() >= deadline)
+			return false;
+		struct pollfd pfd{ fd, POLLOUT, 0 };
+		::poll(&pfd, 1, 50);
+	}
+	return true;
+}
+
+void teardown_handle(datarover_core *core)
+{
+	if (core->worker.joinable())
+	{
+		if (running_machine *m = core->machine.load(std::memory_order_acquire))
+			m->schedule_exit();
+		core->worker.join();
+	}
+	delete mame_machine_manager::instance();
+	datarover_core *expected = core;
+	s_live.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+	delete core;
+}
 
 } // namespace
 
@@ -45,34 +457,186 @@ const uint8_t *datarover_framebuffer_bytes(void *machine)
 	return static_cast<const uint8_t *>(space.get_read_ptr(base));
 }
 
-// Task 2: lifecycle lands here.
-void *datarover_create(const char *, const char *, const char *)
+void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *rom_path)
 {
-	return nullptr;
+	auto core = std::make_unique<datarover_core>();
+	core->options = std::make_unique<osd_options>();
+	core->osd = std::make_unique<core_headless_osd>();
+
+	emu_options &opts = *core->options;
+	try
+	{
+		opts.set_system_name("datarover840");
+	}
+	catch (...)
+	{
+		return nullptr;
+	}
+	const int prio = OPTION_PRIORITY_CMDLINE;
+	if (nvram_dir && *nvram_dir)
+		opts.set_value(OPTION_NVRAM_DIRECTORY, nvram_dir, prio);
+	if (cfg_dir && *cfg_dir)
+		opts.set_value(OPTION_CFG_DIRECTORY, cfg_dir, prio);
+	if (rom_path && *rom_path)
+		opts.set_value(OPTION_MEDIAPATH, rom_path, prio);
+	// Headless defaults matching the regression harness (-video none -sound
+	// none, no INI side effects, no Lua/plugins/debugger, no UI pauses,
+	// unthrottled free-run paced by the caller).
+	opts.set_value(OPTION_READCONFIG, 0, prio);
+	opts.set_value(OPTION_WRITECONFIG, 0, prio);
+	opts.set_value(OPTION_PLUGINS, 0, prio);
+	opts.set_value(OPTION_CONSOLE, 0, prio);
+	opts.set_value(OPTION_DEBUG, 0, prio);
+	opts.set_value(OPTION_THROTTLE, 0, prio);
+	opts.set_value(OPTION_SKIP_GAMEINFO, 1, prio);
+	opts.set_value(OPTION_SECONDS_TO_RUN, 0, prio);
+	opts.set_value("video", "none", prio);
+	opts.set_value("sound", "none", prio);
+	// In-process serial card for UART-A (the harness uses an external PTY
+	// here); install_package writes to this card's slave side.
+	if (::slot_option *rs2321 = opts.find_slot_option("rs2321"))
+		rs2321->specify("pty");
+
+	datarover_core *handle = core.release();
+	datarover_core *expected = nullptr;
+	if (!s_live.compare_exchange_strong(expected, handle, std::memory_order_acq_rel))
+	{
+		delete handle;
+		return nullptr;
+	}
+	try
+	{
+		handle->worker = std::thread([handle]()
+		{
+			// The real manager: frame/update paths dereference the singleton.
+			mame_machine_manager *manager = mame_machine_manager::instance(*handle->options, *handle->osd);
+			// run() touches manager->http() unconditionally; the CLI starts
+			// it the same way (clifront.cpp: start_execution).
+			manager->start_http_server();
+			int index = driver_list::find("datarover840");
+			if (index < 0)
+			{
+				std::lock_guard<std::mutex> lock(handle->mutex);
+				handle->boot_failed = true;
+				handle->ready = true;
+				handle->ready_cv.notify_all();
+				return;
+			}
+			try
+			{
+				machine_config config(driver_list::driver(index), *handle->options);
+				running_machine machine(config, *manager);
+				handle->machine.store(&machine, std::memory_order_release);
+				{
+					std::lock_guard<std::mutex> lock(handle->mutex);
+					handle->ready = true;
+				}
+				handle->ready_cv.notify_all();
+				// Quiet: skip sound recording/startup chatter under the null sink.
+				handle->run_result = machine.run(true);
+				handle->machine.store(nullptr, std::memory_order_release);
+			}
+			catch (...)
+			{
+				std::lock_guard<std::mutex> lock(handle->mutex);
+				handle->boot_failed = true;
+				handle->ready = true;
+				handle->ready_cv.notify_all();
+			}
+		});
+	}
+	catch (...)
+	{
+		teardown_handle(handle);
+		return nullptr;
+	}
+	{
+		std::unique_lock<std::mutex> lock(handle->mutex);
+		handle->ready_cv.wait_for(lock, std::chrono::seconds(120), [handle]() { return handle->ready; });
+		if (!handle->ready || handle->boot_failed)
+		{
+			lock.unlock();
+			teardown_handle(handle);
+			return nullptr;
+		}
+	}
+	return handle;
 }
 
-// Task 2: lifecycle lands here.
-void datarover_destroy(void *)
+void datarover_destroy(void *machine)
 {
+	if (!machine)
+		return;
+	teardown_handle(static_cast<datarover_core *>(machine));
 }
 
-// Task 2: pen input lands here.
-void datarover_pen_down(void *, int, int)
+void datarover_pen_down(void *machine, int x, int y)
 {
+	if (!machine)
+		return;
+	inject_pen(static_cast<datarover_core *>(machine)->machine.load(std::memory_order_acquire), x, y, true);
 }
 
-// Task 2: pen input lands here.
-void datarover_pen_move(void *, int, int)
+void datarover_pen_move(void *machine, int x, int y)
 {
+	if (!machine)
+		return;
+	inject_pen(static_cast<datarover_core *>(machine)->machine.load(std::memory_order_acquire), x, y, true);
 }
 
-// Task 2: pen input lands here.
-void datarover_pen_up(void *)
+void datarover_pen_up(void *machine)
 {
+	if (!machine)
+		return;
+	datarover_core *core = static_cast<datarover_core *>(machine);
+	running_machine *m = core->machine.load(std::memory_order_acquire);
+	if (!m)
+		return;
+	if (ioport_port *port = m->root_device().ioport("TOUCH_BUTTON"))
+		if (ioport_field *field = port->field(0x01))
+			field->clear_value();
 }
 
-// Task 2: package install lands here.
-int datarover_install_package(void *, const uint8_t *, size_t)
+// Package install: port of tools/pclink_send.py (C++ codec choice — no
+// subprocess/helper; the bytes never leave the process). Encodes the SPkg
+// metadata packet (WinPCLink 0x404 layout, filename "package.pkg"), the
+// package stream (raw bytes + four NULs as its own CRC stream), and a Ping
+// barrier packet exactly as pclink_send.py queues them, then writes the wire
+// to the rs2321 PTY slave. Caller-thread write is safe: the PTY master is
+// kernel-buffered and the emulation thread drains it via the card poll timer
+// into UART-A. Returns 0 when the full wire was accepted for in-process
+// delivery, 1 on no live machine / empty payload / no PTY / write failure.
+// Protocol note (honest boundary): the guest must already sit at the Storeroom
+// computer (which emits Cnct/ChMa); the Pong barrier and GBye close belong to
+// the Task 4 verification, not this staging call.
+int datarover_install_package(void *machine, const uint8_t *data, size_t len)
 {
-	return 0;
+	if (!machine || !data || len == 0)
+		return 1;
+	datarover_core *core = static_cast<datarover_core *>(machine);
+	running_machine *m = core->machine.load(std::memory_order_acquire);
+	if (!m)
+		return 1;
+
+	const std::string name("package.pkg");
+	std::vector<uint8_t> meta = pclink_package_metadata(static_cast<uint32_t>(len), name);
+	const char kSPkg[4] = { 'S', 'P', 'k', 'g' };
+	const char kPing[4] = { 'P', 'i', 'n', 'g' };
+	std::vector<uint8_t> wire = pclink_encode_packet(kSPkg, meta.data(), meta.size());
+	std::vector<uint8_t> stream_in(len + 4, 0);
+	std::memcpy(stream_in.data(), data, len);
+	std::vector<uint8_t> stream = pclink_encode_crc_stream(stream_in.data(), stream_in.size());
+	wire.insert(wire.end(), stream.begin(), stream.end());
+	std::vector<uint8_t> ping = pclink_encode_packet(kPing, nullptr, 0);
+	wire.insert(wire.end(), ping.begin(), ping.end());
+
+	const std::string slave = pty_slave_path(m);
+	if (slave.empty())
+		return 1;
+	const int fd = ::open(slave.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+	if (fd < 0)
+		return 1;
+	const bool ok = write_all_fd(fd, wire.data(), wire.size());
+	::close(fd);
+	return ok ? 0 : 1;
 }

@@ -11,6 +11,9 @@ extern "C" {
 #define DATAROVER_FB_SIZE (480 * 320 / 4)  // 2bpp, matches FRAME_BYTES
 
 // Framebuffer access (valid after machine boot; pointer owned by core).
+// The pointer may be NULL: get_read_ptr() returns NULL for non-RAM-backed
+// mappings (unmapped/ROM/device handlers) and pre-boot, mirroring the
+// scanout power-gated black-fill path. The caller must null-check.
 const uint8_t *datarover_framebuffer_bytes(void *machine);
 size_t datarover_framebuffer_size(void);
 // Lifecycle + input + package + paths land in Task 2; declared here:
