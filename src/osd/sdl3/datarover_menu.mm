@@ -124,14 +124,34 @@ sdl_window_info *first_live_window(running_machine &machine)
 	running_machine *machine = current_machine();
 	if (!machine)
 		return;
-	// PTY discovery: DATAROVER_PCLINK_PTY written by the launcher at
-	// startup.  The handler cannot read launcher stdout (where MAME
-	// announces ":rs2321:pty PTY: <path>"), and walking
-	// machine.root_device() for the "pty" rs232 option device plus
-	// device_pty_interface::slave_name() is fragile from ObjC++, so the
-	// env var is the injection point.
+	// PTY discovery: env var primary, run-file fallback.  The launcher
+	// exports MAGIC_CAP_EMULATOR_ROOT (known pre-exec) but cannot export
+	// DATAROVER_PCLINK_PTY — the slave path only exists after the emulator
+	// starts, and exec freezes the environment — so a disowned scraper
+	// publishes the ":rs2321:pty PTY: <path>" announcement to
+	// ~/Library/Application Support/DataRover/run/pclink-pty.  Walking
+	// machine.root_device() for the "pty" device plus slave_name() is
+	// fragile from ObjC++, so env-then-file is the injection point.
 	const char *pty = getenv("DATAROVER_PCLINK_PTY");
-	if (!pty || !*pty)
+	NSString *ptyPath = nil;
+	if (pty && *pty)
+		ptyPath = [NSString stringWithUTF8String:pty];
+	if (!ptyPath)
+	{
+		NSString *runFile = [NSHomeDirectory() stringByAppendingPathComponent:
+			@"Library/Application Support/DataRover/run/pclink-pty"];
+		NSError *readError = nil;
+		NSString *contents = [NSString stringWithContentsOfFile:runFile
+			encoding:NSUTF8StringEncoding error:&readError];
+		if (!readError)
+		{
+			ptyPath = [contents stringByTrimmingCharactersInSet:
+				[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+			if ([ptyPath length] == 0)
+				ptyPath = nil;
+		}
+	}
+	if (!ptyPath)
 	{
 		machine->ui().popup_time(5, "PCLink serial port not available");
 		return;
@@ -172,7 +192,7 @@ sdl_window_info *first_live_window(running_machine &machine)
 	}
 	NSTask *task = [[[NSTask alloc] init] autorelease];
 	[task setLaunchPath:@"/usr/bin/python3"];
-	[task setArguments:@[script, @"--pty", [NSString stringWithUTF8String:pty],
+	[task setArguments:@[script, @"--pty", ptyPath,
 		@"--package", path]];
 	@try
 	{
