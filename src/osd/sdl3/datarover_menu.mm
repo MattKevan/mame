@@ -415,7 +415,8 @@ extern "C" void datarover_install_menu(void)
 	[deviceMenu addItem:menu_entry(@"Option Button", @"", @selector(pressOption:))];
 	install_submenu(bar, @"Device", deviceMenu);
 
-		[NSApp setMainMenu:bar];
+	[NSApp setMainMenu:bar];
+	NSLog(@"DataRover: installed %lu menus", (unsigned long)[bar numberOfItems]);
 	}
 }
 
