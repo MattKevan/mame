@@ -287,17 +287,12 @@ void sdl_window_info::update_cursor_state()
 		bool should_hide_mouse = downcast<sdl_osd_interface&>(machine().osd()).should_hide_mouse();
 		bool alt_released = downcast<sdl_osd_interface&>(machine().osd()).alt_held();
 
-		if ((!fullscreen() && !should_hide_mouse) || alt_released)
+		if ((!fullscreen() && !should_hide_mouse) || alt_released
+			|| strncmp(machine().system().name, "datarover", 9) == 0)
 		{
 			show_pointer();
 			release_pointer();
 		}
-		else
-		{
-			hide_pointer();
-			capture_pointer();
-		}
-
 		if (strncmp(machine().system().name, "datarover", 9) == 0)
 		{
 			static SDL_Cursor *s_stylus_cursor = nullptr;
