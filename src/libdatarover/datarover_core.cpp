@@ -70,8 +70,8 @@
 #include <poll.h>
 #include <string>
 #include <thread>
+#include <termios.h>
 #include <unistd.h>
-#include <vector>
 
 GAME_EXTERN(datarover840);
 
@@ -94,7 +94,7 @@ constexpr uint32_t DRAM_LIMIT = 0x00400000U;
 // zlib.crc32 (0xCBF43926 for "123456789") and therefore the ~crc32 framing
 // the unit tests pin in tests/test_pclink_regression.py.
 
-uint32_t pclink_crc32(const uint8_t *data, size_t len)
+const uint32_t *pclink_crc32_table()
 {
 	static uint32_t table[256];
 	static const bool init = []()
@@ -109,6 +109,12 @@ uint32_t pclink_crc32(const uint8_t *data, size_t len)
 		return true;
 	}();
 	(void)init;
+	return table;
+}
+
+uint32_t pclink_crc32(const uint8_t *data, size_t len)
+{
+	const uint32_t *table = pclink_crc32_table();
 	uint32_t crc = 0xFFFFFFFFU;
 	for (size_t i = 0; i < len; ++i)
 		crc = table[(crc ^ data[i]) & 0xFFU] ^ (crc >> 8);
@@ -152,6 +158,75 @@ std::vector<uint8_t> pclink_encode_crc_stream(const uint8_t *data, size_t len)
 	return wire;
 }
 
+// --- PCLink wire decode: mirrors tools/pclink_send.py decode_crc_stream +
+// decode_packet, needed for the Cnct/Pong handshake (the guest speaks first).
+// Returns false on any truncation, bad length, CRC mismatch, or escape error.
+struct pclink_packet
+{
+	char tag[4];
+	std::vector<uint8_t> payload;
+};
+bool pclink_decode_packet(const uint8_t *wire, size_t wire_len, pclink_packet &out)
+{
+	std::vector<uint8_t> encoded;
+	encoded.reserve(wire_len);
+	size_t pos = 0;
+	while (pos < wire_len)
+	{
+		if (wire_len - pos < 2)
+			return false;
+		const size_t size = (static_cast<size_t>(wire[pos]) << 8) | wire[pos + 1];
+		pos += 2;
+		if (size < 1 || size > 256)
+			return false;
+		if (wire_len - pos < size + 4)
+			return false;
+		uint32_t crc = 0xFFFFFFFFU;
+		const uint32_t *table = pclink_crc32_table();
+		for (size_t i = 0; i < size; ++i)
+			crc = table[(crc ^ wire[pos + i]) & 0xFFU] ^ (crc >> 8);
+		crc ^= 0xFFFFFFFFU;
+		uint32_t expected = (static_cast<uint32_t>(wire[pos + size]) << 24)
+			| (static_cast<uint32_t>(wire[pos + size + 1]) << 16)
+			| (static_cast<uint32_t>(wire[pos + size + 2]) << 8)
+			| wire[pos + size + 3];
+		if ((~crc & 0xFFFFFFFFU) != expected)
+			return false;
+		encoded.insert(encoded.end(), wire + pos, wire + pos + size);
+		pos += size + 4;
+	}
+	bool escaped = false;
+	std::vector<uint8_t> stream;
+	stream.reserve(encoded.size());
+	for (uint8_t v : encoded)
+	{
+		if (escaped)
+		{
+			if (v != 0x0e && v != 0x0f && v != 0x10)
+				return false;
+			stream.push_back(v);
+			escaped = false;
+		}
+		else if (v == 0x10)
+			escaped = true;
+		else if (v == 0x0e || v == 0x0f)
+			return false;
+		else
+			stream.push_back(v);
+	}
+	if (escaped || stream.size() < 8)
+		return false;
+	const size_t declared = (static_cast<size_t>(stream[4]) << 24)
+		| (static_cast<size_t>(stream[5]) << 16)
+		| (static_cast<size_t>(stream[6]) << 8)
+		| stream[7];
+	if (stream.size() != declared + 8)
+		return false;
+	std::memcpy(out.tag, stream.data(), 4);
+	out.payload.assign(stream.begin() + 8, stream.end());
+	return true;
+}
+
 std::vector<uint8_t> pclink_encode_packet(const char tag[4], const uint8_t *payload, size_t payload_len)
 {
 	std::vector<uint8_t> raw;
@@ -159,11 +234,11 @@ std::vector<uint8_t> pclink_encode_packet(const char tag[4], const uint8_t *payl
 	for (int i = 0; i < 4; ++i)
 		raw.push_back(static_cast<uint8_t>(tag[i]));
 	pclink_put_be32(raw, static_cast<uint32_t>(payload_len));
-	raw.insert(raw.end(), payload, payload + payload_len);
+	if (payload_len)
+		raw.insert(raw.end(), payload, payload + payload_len);
 	return pclink_encode_crc_stream(raw.data(), raw.size());
 }
-
-std::vector<uint8_t> pclink_package_metadata(uint32_t size, const std::string &name)
+std::vector<uint8_t> pclink_package_metadata(uint32_t size, const std::vector<uint8_t> &name16, uint32_t char_count)
 {
 	std::vector<uint8_t> meta(0x404, 0);
 	auto put32 = [&meta](size_t off, uint32_t v)
@@ -176,15 +251,9 @@ std::vector<uint8_t> pclink_package_metadata(uint32_t size, const std::string &n
 	put32(0, size);
 	put32(4, size);
 	put32(24, 0x80000000U);
-	put32(28, static_cast<uint32_t>(name.size()));
-	size_t off = 32;
-	for (char c : name)
-	{
-		if (off + 1 >= meta.size())
-			break;
-		meta[off++] = 0x00;
-		meta[off++] = static_cast<uint8_t>(c);
-	}
+	put32(28, char_count);
+	const size_t n = std::min(name16.size(), meta.size() - 32);
+	std::memcpy(meta.data() + 32, name16.data(), n);
 	return meta;
 }
 
@@ -597,46 +666,184 @@ void datarover_pen_up(void *machine)
 			field->clear_value();
 }
 
-// Package install: port of tools/pclink_send.py (C++ codec choice — no
-// subprocess/helper; the bytes never leave the process). Encodes the SPkg
-// metadata packet (WinPCLink 0x404 layout, filename "package.pkg"), the
-// package stream (raw bytes + four NULs as its own CRC stream), and a Ping
-// barrier packet exactly as pclink_send.py queues them, then writes the wire
-// to the rs2321 PTY slave. Caller-thread write is safe: the PTY master is
-// kernel-buffered and the emulation thread drains it via the card poll timer
-// into UART-A. Returns 0 when the full wire was accepted for in-process
-// delivery, 1 on no live machine / empty payload / no PTY / write failure.
-// Protocol note (honest boundary): the guest must already sit at the Storeroom
-// computer (which emits Cnct/ChMa); the Pong barrier and GBye close belong to
-// the Task 4 verification, not this staging call.
-int datarover_install_package(void *machine, const uint8_t *data, size_t len)
+// Package install: port of tools/pclink_send.py main() handshake. The guest
+// speaks first (ChMa magic + Cnct request); the host answers Cntd twice
+// (Magic Cap requires both), sends SPkg metadata + package stream, waits for
+// Pong, then sends GBye. Mirrors pclink_send.py:238-288 exactly, including
+// raw PTY mode (configure_raw_pty) and the monotonic deadlines.
+// Returns 0 on observed Pong + GBye write; 1 on any timeout/protocol/IO error.
+namespace {
+bool read_available_fd(int fd, std::vector<uint8_t> &out)
 {
-	if (!machine || !data || len == 0)
+	for (;;)
+	{
+		struct pollfd pfd{ fd, POLLIN, 0 };
+		if (::poll(&pfd, 1, 0) <= 0)
+			return true;
+		uint8_t buf[65536];
+		ssize_t n = ::read(fd, buf, sizeof(buf));
+		if (n > 0)
+			out.insert(out.end(), buf, buf + n);
+		else if (n == 0)
+			return true;
+		else if (errno != EAGAIN && errno != EINTR)
+			return false;
+	}
+}
+bool set_raw_fd(int fd)
+{
+	struct termios attrs;
+	if (::tcgetattr(fd, &attrs) != 0)
+		return false;
+	::cfmakeraw(&attrs);
+	attrs.c_cflag |= CS8 | CREAD | CLOCAL;
+	attrs.c_cc[VMIN] = 0;
+	attrs.c_cc[VTIME] = 0;
+	return ::tcsetattr(fd, TCSANOW, &attrs) == 0;
+}
+} // namespace
+int datarover_install_package_named(void *machine, const uint8_t *data, size_t len,
+		const char *filename_utf8)
+{
+	if (!machine || !data || len == 0 || !filename_utf8 || !*filename_utf8)
 		return 1;
 	datarover_core *core = static_cast<datarover_core *>(machine);
 	running_machine *m = core->machine.load(std::memory_order_acquire);
 	if (!m)
 		return 1;
-
-	const std::string name("package.pkg");
-	std::vector<uint8_t> meta = pclink_package_metadata(static_cast<uint32_t>(len), name);
-	const char kSPkg[4] = { 'S', 'P', 'k', 'g' };
-	const char kPing[4] = { 'P', 'i', 'n', 'g' };
-	std::vector<uint8_t> wire = pclink_encode_packet(kSPkg, meta.data(), meta.size());
-	std::vector<uint8_t> stream_in(len + 4, 0);
-	std::memcpy(stream_in.data(), data, len);
-	std::vector<uint8_t> stream = pclink_encode_crc_stream(stream_in.data(), stream_in.size());
-	wire.insert(wire.end(), stream.begin(), stream.end());
-	std::vector<uint8_t> ping = pclink_encode_packet(kPing, nullptr, 0);
-	wire.insert(wire.end(), ping.begin(), ping.end());
-
 	const std::string slave = pty_slave_path(m);
 	if (slave.empty())
 		return 1;
 	const int fd = ::open(slave.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (fd < 0)
 		return 1;
-	const bool ok = write_all_fd(fd, wire.data(), wire.size());
+	if (!set_raw_fd(fd))
+	{
+		::close(fd);
+		return 1;
+	}
+	const char kChMa[4] = { 'C', 'h', 'M', 'a' };
+	const char kCnct[4] = { 'C', 'n', 'c', 't' };
+	const char kCntd[4] = { 'C', 'n', 't', 'd' };
+	const char kSPkg[4] = { 'S', 'P', 'k', 'g' };
+	const char kPing[4] = { 'P', 'i', 'n', 'g' };
+	const char kPong[4] = { 'P', 'o', 'n', 'g' };
+	const char kGBye[4] = { 'G', 'B', 'y', 'e' };
+	std::vector<uint8_t> device_wire;
+	size_t connect_len = 0;
+	const auto cnct_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
+	for (;;)
+	{
+		if (!read_available_fd(fd, device_wire))
+		{
+			::close(fd);
+			return 1;
+		}
+		if (device_wire.size() >= 4
+			&& std::memcmp(device_wire.data(), kChMa, 4) == 0)
+		{
+			pclink_packet pkt;
+			if (pclink_decode_packet(device_wire.data() + 4,
+					device_wire.size() - 4, pkt)
+				&& std::memcmp(pkt.tag, kCnct, 4) == 0)
+			{
+				connect_len = device_wire.size();
+				break;
+			}
+		}
+		if (std::chrono::steady_clock::now() >= cnct_deadline)
+		{
+			::close(fd);
+			return 1;
+		}
+		struct pollfd pfd{ fd, POLLIN, 0 };
+		::poll(&pfd, 1, 50);
+	}
+	std::vector<uint8_t> cntd = pclink_encode_packet(kCntd, nullptr, 0);
+	cntd.insert(cntd.end(), cntd.begin(), cntd.begin() + cntd.size() / 2);
+	if (!write_all_fd(fd, cntd.data(), cntd.size()))
+	{
+		::close(fd);
+		return 1;
+	}
+	// UTF-8 filename -> UTF-16BE + WinPCLink character count (not byte count).
+	std::vector<uint8_t> name16;
+	uint32_t char_count = 0;
+	for (size_t i = 0; filename_utf8[i];)
+	{
+		uint32_t cp;
+		unsigned char c = static_cast<unsigned char>(filename_utf8[i]);
+		size_t seqlen;
+		if (c < 0x80) { cp = c; seqlen = 1; }
+		else if ((c & 0xe0) == 0xc0) { cp = c & 0x1f; seqlen = 2; }
+		else if ((c & 0xf0) == 0xe0) { cp = c & 0x0f; seqlen = 3; }
+		else if ((c & 0xf8) == 0xf0) { cp = c & 0x07; seqlen = 4; }
+		else break;
+		for (size_t k = 1; k < seqlen; ++k)
+		{
+			unsigned char cc = static_cast<unsigned char>(filename_utf8[i + k]);
+			if ((cc & 0xc0) != 0x80) { cp = 0xfffd; seqlen = k; break; }
+			cp = (cp << 6) | (cc & 0x3f);
+		}
+		if (cp >= 0x10000) { cp -= 0x10000; name16.push_back(static_cast<uint8_t>(((0xd800 | (cp >> 10)) >> 8) & 0xff)); name16.push_back(static_cast<uint8_t>((0xd800 | (cp >> 10)) & 0xff)); name16.push_back(static_cast<uint8_t>(((0xdc00 | (cp & 0x3ff)) >> 8) & 0xff)); name16.push_back(static_cast<uint8_t>((0xdc00 | (cp & 0x3ff)) & 0xff)); char_count += 2; }
+		else { name16.push_back(static_cast<uint8_t>((cp >> 8) & 0xff)); name16.push_back(static_cast<uint8_t>(cp & 0xff)); char_count += 1; }
+		i += seqlen;
+	}
+	std::vector<uint8_t> meta = pclink_package_metadata(static_cast<uint32_t>(len), name16, char_count);
+	std::vector<uint8_t> meta_wire = pclink_encode_packet(kSPkg, meta.data(), meta.size());
+	if (!write_all_fd(fd, meta_wire.data(), meta_wire.size()))
+	{
+		::close(fd);
+		return 1;
+	}
+	std::vector<uint8_t> stream_in(len + 4, 0);
+	std::memcpy(stream_in.data(), data, len);
+	std::vector<uint8_t> stream = pclink_encode_crc_stream(stream_in.data(), stream_in.size());
+	if (!write_all_fd(fd, stream.data(), stream.size()))
+	{
+		::close(fd);
+		return 1;
+	}
+	std::vector<uint8_t> ping = pclink_encode_packet(kPing, nullptr, 0);
+	std::vector<uint8_t> pong = pclink_encode_packet(kPong, nullptr, 0);
+	std::vector<uint8_t> gbye = pclink_encode_packet(kGBye, nullptr, 0);
+	if (!write_all_fd(fd, ping.data(), ping.size()))
+	{
+		::close(fd);
+		return 1;
+	}
+	bool pong_seen = false;
+	const auto pong_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
+	for (;;)
+	{
+		if (!read_available_fd(fd, device_wire))
+		{
+			::close(fd);
+			return 1;
+		}
+		if (device_wire.size() > connect_len
+			&& std::search(device_wire.begin() + connect_len, device_wire.end(),
+				pong.begin(), pong.end()) != device_wire.end())
+		{
+			pong_seen = true;
+			break;
+		}
+		if (std::chrono::steady_clock::now() >= pong_deadline)
+			break;
+		struct pollfd pfd{ fd, POLLIN, 0 };
+		::poll(&pfd, 1, 50);
+	}
+	if (!pong_seen)
+	{
+		::close(fd);
+		return 1;
+	}
+	const bool ok = write_all_fd(fd, gbye.data(), gbye.size());
 	::close(fd);
 	return ok ? 0 : 1;
+}
+
+int datarover_install_package(void *machine, const uint8_t *data, size_t len)
+{
+	return datarover_install_package_named(machine, data, len, "package.pkg");
 }

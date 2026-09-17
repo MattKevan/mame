@@ -344,6 +344,7 @@ project ("osd_" .. _OPTIONS["osd"])
 	osdmodulesbuild()
 
 	includedirs {
+		MAME_DIR .. "src",
 		MAME_DIR .. "src/emu",
 		MAME_DIR .. "src/devices", -- accessing imagedev from debugger
 		MAME_DIR .. "src/osd",

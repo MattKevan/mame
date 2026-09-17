@@ -23,6 +23,10 @@ void datarover_pen_down(void *machine, int x, int y);
 void datarover_pen_move(void *machine, int x, int y);
 void datarover_pen_up(void *machine);
 int datarover_install_package(void *machine, const uint8_t *data, size_t len);
+// Named variant: filename controls the guest-visible Storeroom name.
+// Character count (not byte count) is recorded per WinPCLink; non-ASCII
+// names are encoded UTF-16BE with a proper character count.
+int datarover_install_package_named(void *machine, const uint8_t *data, size_t len, const char *filename_utf8);
 
 #ifdef __cplusplus
 }
