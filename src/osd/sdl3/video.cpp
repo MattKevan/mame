@@ -23,7 +23,9 @@
 #include "rendutil.h"
 #include "uiinput.h"
 
-#include <SDL3/SDL.h>
+#if defined(SDLMAME_MACOSX)
+extern "C" void datarover_install_menu(void);
+#endif
 
 
 //============================================================
@@ -78,10 +80,14 @@ bool sdl_osd_interface::video_init()
 		SDL_RaiseWindow(sdlwindow);
 
 #ifdef SDLMAME_MACOSX
-		// ensure focus is acquired before the input modules start polling
-		process_events();
-		if (!has_focus())
-			osd_printf_verbose("Window did not acquire input focus\n");
+	// ensure focus is acquired before the input modules start polling
+	process_events();
+	if (!has_focus())
+		osd_printf_verbose("Window did not acquire input focus\n");
+	// SDL installs its own default menubar at window-creation time,
+	// clobbering the menu installed during OSD init. Reinstall ours
+	// now that the window exists (idempotent: builds a fresh bar).
+	datarover_install_menu();
 #endif
 	}
 
