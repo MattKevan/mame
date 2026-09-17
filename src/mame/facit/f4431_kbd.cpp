@@ -7,6 +7,7 @@
     TODO:
     - Speaker sounds weird
     - Verify country codes
+    - Verify LAT/CYR firmware layout selection and key legends
 
     Notes:
     - Also supports F4420 and F4430?
@@ -37,20 +38,6 @@ void f4431_kbd_device::mem_map(address_map &map)
 void f4431_kbd_device::io_map(address_map &map)
 {
 	map(0x00, 0xff).rw(FUNC(f4431_kbd_device::data_r), FUNC(f4431_kbd_device::data_w));
-}
-
-//-------------------------------------------------
-//  rom_region - device-specific ROM region
-//-------------------------------------------------
-
-ROM_START( firmware )
-	ROM_REGION(0x800, "mcu", 0)
-	ROM_LOAD("11419660-00_kb31.u3", 0x000, 0x800, CRC(45b90749) SHA1(91d0ef181fe05e9474871e26dc75c313cb67c337))
-ROM_END
-
-const tiny_rom_entry *f4431_kbd_device::device_rom_region() const
-{
-	return ROM_NAME(firmware);
 }
 
 //-------------------------------------------------

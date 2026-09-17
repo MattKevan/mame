@@ -419,6 +419,17 @@ void f4431_state::f4431(machine_config &config)
 //**************************************************************************
 
 ROM_START( f4431 )
+	// Select the firmware for the fixed keyboard device at system level.
+	ROM_DEFAULT_BIOS("kb31")
+	ROM_SYSTEM_BIOS(0, "kb31", "Keyboard: KB31")
+	ROM_SYSTEM_BIOS(1, "latcyr", "Keyboard: KBCL LAT/CYR")
+
+	ROM_REGION(0x800, "kbd:mcu", 0)
+	ROMX_LOAD("11419660-00_kb31.u3", 0x000, 0x800, CRC(45b90749) SHA1(91d0ef181fe05e9474871e26dc75c313cb67c337), ROM_BIOS(0))
+	// From an English/Russian keyboard. Sticker: "4431 KBCL", "LAT/CYR", "6800 U3".
+	// The matching terminal character generator and physical layout selection are unverified.
+	ROMX_LOAD("4431_kbcl_lat_cyr_6800.u3", 0x000, 0x800, CRC(7ab50d44) SHA1(d1be9d741cfce62edd53f64fd4c1ac2dab78e932), ROM_BIOS(1))
+
 	ROM_REGION(0x6000, "maincpu", 0)
 	ROM_LOAD("11420050-00_4431.d73", 0x0000, 0x1000, CRC(e7a9c982) SHA1(60c2eb769bd6051b4acaf38750ef40b9d02c568c))
 	ROM_COPY("maincpu", 0x0000, 0x1000, 0x1000)
