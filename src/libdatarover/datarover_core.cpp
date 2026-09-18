@@ -603,10 +603,14 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	// MAXIMUM priority: nothing downstream may re-arm startup screens.
 	opts.set_value(OSDOPTION_VIDEO, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
 	opts.set_value(OSDOPTION_SOUND, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
-	// In-process serial card for UART-A (the harness uses an external PTY
-	// here); install_package writes to this card's slave side.
+	// Serial card: the desktop harness uses an external PTY here and
+	// install_package writes to that card's slave side — but iOS sandboxes
+	// /dev/ptmx (the log's deny(1) file-read-data), so openpty fails, the
+	// card never opens, and boot throws at device start. Default to
+	// null_modem (same slot, no PTY): boot proceeds, package install
+	// reports failure instead of crashing.
 	if (::slot_option *rs2321 = opts.find_slot_option("rs2321"))
-		rs2321->specify("pty");
+		rs2321->specify("null_modem");
 
 	datarover_core *handle = core.release();
 	datarover_core *expected = nullptr;
