@@ -420,6 +420,10 @@ struct datarover_core
 	ioport_field *pen_x = nullptr;
 	ioport_field *pen_y = nullptr;
 	ioport_field *pen_button = nullptr;
+	// rs2321 slot + card resolved once on the worker thread at boot; the
+	// caller thread must never subdevice()-lookup (same tagmap race).
+	device_slot_interface *rs2321_slot = nullptr;
+	device_t *rs2321_card = nullptr;
 };
 
 // One live handle per process: mame_machine_manager::instance() binds a single
@@ -449,20 +453,12 @@ void inject_pen(datarover_core *core, int x, int y, bool button)
 	}
 }
 
-// Find the rs2321 PTY slave path through public device APIs only
-// (slot interface + PTY interface; no rs232 card headers needed).
-std::string pty_slave_path(running_machine *m)
+// The caller passes the boot-cached slot + card: resolving "rs2321" via
+// subdevice() on the caller thread races device-tree teardown
+// (unordered_map deallocator) and faults exactly like the framebuffer path.
+std::string pty_slave_path(device_slot_interface *slot, device_t *card)
 {
-	if (!m)
-		return std::string();
-	device_t *port = m->root_device().subdevice("rs2321");
-	if (!port)
-		return std::string();
-	device_slot_interface *slot = dynamic_cast<device_slot_interface *>(port);
-	if (!slot)
-		return std::string();
-	device_t *card = slot->get_card_device();
-	if (!card)
+	if (!slot || !card)
 		return std::string();
 	device_pty_interface *pty = dynamic_cast<device_pty_interface *>(card);
 	if (!pty || !pty->is_slave_connected())
@@ -610,6 +606,12 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 					handle->pen_y = py->field(0xffff);
 				if (ioport_port *pb = machine.root_device().ioport("TOUCH_BUTTON"))
 					handle->pen_button = pb->field(0x01);
+				if (device_t *rs = machine.root_device().subdevice("rs2321"))
+				{
+					handle->rs2321_slot = dynamic_cast<device_slot_interface *>(rs);
+					if (handle->rs2321_slot)
+						handle->rs2321_card = handle->rs2321_slot->get_card_device();
+				}
 				handle->machine.store(&machine, std::memory_order_release);
 				{
 					std::lock_guard<std::mutex> lock(handle->mutex);
@@ -618,6 +620,13 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 				handle->ready_cv.notify_all();
 				// Quiet: skip sound recording/startup chatter under the null sink.
 				handle->run_result = machine.run(true);
+				// Invalidate worker-resolved pointers at exit: the device
+				// tree is torn down with run(), so caller threads must see
+				// nulls rather than dangling pointers.
+				handle->memintf = nullptr;
+				handle->pen_x = handle->pen_y = handle->pen_button = nullptr;
+				handle->rs2321_slot = nullptr;
+				handle->rs2321_card = nullptr;
 				handle->machine.store(nullptr, std::memory_order_release);
 			}
 			catch (...)
@@ -723,7 +732,7 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	running_machine *m = core->machine.load(std::memory_order_acquire);
 	if (!m)
 		return 1;
-	const std::string slave = pty_slave_path(m);
+	const std::string slave = pty_slave_path(core->rs2321_slot, core->rs2321_card);
 	if (slave.empty())
 		return 1;
 	const int fd = ::open(slave.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
