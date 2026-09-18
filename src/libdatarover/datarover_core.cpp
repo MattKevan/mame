@@ -64,12 +64,12 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
-#include <cstring>
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <poll.h>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <termios.h>
 #include <unistd.h>
@@ -569,7 +569,27 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	if (cfg_dir && *cfg_dir)
 		opts.set_value(OPTION_CFG_DIRECTORY, cfg_dir, prio);
 	if (rom_path && *rom_path)
-		opts.set_value(OPTION_MEDIAPATH, rom_path, prio);
+	{
+		// OPTION_MEDIAPATH is a semicolon-separated search DIRECTORY list:
+		// the loader opens <dir>/datarover840/magiccap-usa.image itself.
+		// The iOS app passes the imported file (…/datarover840/<name>),
+		// so normalize file paths to their parent set directory and strip
+		// any trailing filename; directory input passes through unchanged.
+		std::string media(rom_path);
+		struct stat st{};
+		if (::stat(media.c_str(), &st) == 0 && !S_ISDIR(st.st_mode))
+		{
+			const size_t slash = media.find_last_of("/\\");
+			if (slash != std::string::npos)
+				media.erase(slash);
+			const size_t set_slash = media.find_last_of("/\\");
+			if (set_slash != std::string::npos
+				&& media.compare(set_slash + 1, std::string::npos, "datarover840") == 0)
+				media.erase(set_slash);
+		}
+		if (!media.empty())
+			opts.set_value(OPTION_MEDIAPATH, media.c_str(), prio);
+	}
 	// Headless defaults matching the regression harness (-video none -sound
 	// none, no INI side effects, no Lua/plugins/debugger, no UI pauses,
 	// unthrottled free-run paced by the caller).
