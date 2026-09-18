@@ -57,6 +57,7 @@
 #include "dipty.h"
 #include "dislot.h"
 #include "frontend/mame/ui/menuitem.h"
+#include "render.h"
 
 #include <algorithm>
 #include <atomic>
@@ -277,6 +278,11 @@ public:
 	{
 		m_machine = &machine;
 		machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&core_headless_osd::on_exit, this));
+		// No OSD window exists headless, so no render target is ever
+		// created — but update_and_render derefs ui_target() (render.h:690
+		// asserts non-null) on every frame_update. A hidden target has a
+		// null UI container, which every DUI consumer null-checks.
+		machine.render().target_alloc(nullptr, RENDER_CREATE_HIDDEN);
 	}
 	void update(bool skip_redraw) override { (void)skip_redraw; }
 	void input_update(bool relative_reset) override { (void)relative_reset; }
