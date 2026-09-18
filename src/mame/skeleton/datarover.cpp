@@ -210,7 +210,11 @@ datarover_irda_device::datarover_irda_device(
 
 void datarover_irda_device::device_start()
 {
-	open();
+	// iOS sandboxes /dev/ptmx (deny file-read-data): openpty fails and
+	// boot throws at device start. Skip the PTY; the poll timer still
+	// runs and read() on a closed PTY returns -1 (ignored).
+	if (!open())
+		return;
 	m_poll_timer = timer_alloc(FUNC(datarover_irda_device::poll), this);
 	m_poll_timer->adjust(attotime::zero, 0, attotime::from_msec(1));
 }
