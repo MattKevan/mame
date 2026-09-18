@@ -416,9 +416,6 @@ extern "C" void datarover_install_menu(void)
 	install_submenu(bar, @"Device", deviceMenu);
 
 	[NSApp setMainMenu:bar];
-	NSLog(@"DataRover: installed %lu menus", (unsigned long)[bar numberOfItems]);
-	NSLog(@"DataRover: mainMenu set: %d", [NSApp mainMenu] == bar);
-	NSLog(@"DataRover: appName: %@", [[NSRunningApplication currentApplication] localizedName]);
 	}
 }
 
