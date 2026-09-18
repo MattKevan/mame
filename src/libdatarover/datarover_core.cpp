@@ -559,6 +559,8 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	opts.set_value(OPTION_THROTTLE, 0, prio);
 	opts.set_value(OPTION_SKIP_GAMEINFO, 1, prio);
 	opts.set_value(OPTION_SECONDS_TO_RUN, 1, prio);
+	opts.set_value(OSDOPTION_VIDEO, OSDOPTVAL_NONE, prio);
+	opts.set_value(OSDOPTION_SOUND, OSDOPTVAL_NONE, prio);
 	// In-process serial card for UART-A (the harness uses an external PTY
 	// here); install_package writes to this card's slave side.
 	if (::slot_option *rs2321 = opts.find_slot_option("rs2321"))
