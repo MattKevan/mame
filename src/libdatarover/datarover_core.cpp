@@ -32,14 +32,11 @@
 // side (docs/pclink.md: Storeroom computer over Dino UART A 19200 8N1,
 // exposed as MAME RS-232 port 1; harness uses -rs2321 pty).
 //
-// Threading contract: the emulation thread owns running_machine, options, OSD
-// and ioport state. Pen/package entry points run on the caller thread and only
-// touch the machine through the atomic pointer plus ioport set_value (plain
-// override writes the ADC path samples next frame) or PTY slave writes
-// (kernel-buffered, consumed by the emulation thread's poll timer) — the same
-// split as the Lua set_value automation and pulsePort. destroy() only signals
-// schedule_exit and joins. Framebuffer bytes may be read from any thread while
-// alive; the pointer is core-owned, valid until destroy returns.
+// Threading contract: the emulation thread exclusively accesses MAME objects.
+// Caller threads enqueue pen states and read locked framebuffer snapshots or
+// a cached PTY path. destroy() requests exit and joins the worker before freeing
+// the handle. Callers must finish other API calls before destroy(). Framebuffer
+// snapshots remain valid until the next framebuffer call on that caller thread.
 
 #include "libdatarover/datarover_core.h"
 
@@ -61,6 +58,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <functional>
+#include <deque>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -273,6 +273,8 @@ class core_headless_osd : public osd_interface
 {
 public:
 	core_headless_osd() = default;
+	std::function<void(running_machine &)> frame_callback;
+	std::function<void()> exit_callback;
 
 	void init(running_machine &machine) override
 	{
@@ -287,7 +289,7 @@ public:
 		render_target *target = machine.render().target_alloc(nullptr, 0);
 		target->set_bounds(480, 320, 1.0F);
 	}
-	void update(bool skip_redraw) override { (void)skip_redraw; }
+	void update(bool skip_redraw) override { (void)skip_redraw; if (m_machine && frame_callback) frame_callback(*m_machine); }
 	void input_update(bool relative_reset) override { (void)relative_reset; }
 	void check_osd_inputs() override { }
 	void set_verbose(bool print_verbose) override { m_verbose = print_verbose; }
@@ -396,7 +398,7 @@ public:
 	}
 
 private:
-	void on_exit() { m_machine = nullptr; }
+	void on_exit() { if (exit_callback) exit_callback(); m_machine = nullptr; }
 
 	running_machine *m_machine = nullptr;
 	bool m_verbose = false;
@@ -411,7 +413,14 @@ struct datarover_core
 	std::condition_variable ready_cv;
 	bool ready = false;
 	bool boot_failed = false;
-	std::atomic<running_machine *> machine{ nullptr };
+	std::atomic<bool> stop_requested{ false };
+	bool active = false;
+	bool frame_valid = false;
+	std::array<uint8_t, DATAROVER_FB_SIZE> frame{};
+	struct pen_event { int x, y; bool down; };
+	std::deque<pen_event> pen_events;
+	int last_pen_x = 0, last_pen_y = 0;
+	std::string slave_path;
 	int run_result = EMU_ERR_NONE;
 	// Device/interface pointers resolved once on the worker thread after
 	// boot (never string-looked-up on the caller thread: the tagmap
@@ -436,20 +445,19 @@ std::atomic<datarover_core *> s_live{ nullptr };
 // latches the adjoverride the live read consults, so the value holds until
 void inject_pen(datarover_core *core, int x, int y, bool button)
 {
-	if (!core || !core->machine.load(std::memory_order_acquire))
-		return;
+	if (!core) return;
+	std::lock_guard<std::mutex> lock(core->mutex);
+	if (!core->active) return;
+	if (x < 0) { x = core->last_pen_x; y = core->last_pen_y; }
 	x = std::clamp(x, 0, DATAROVER_FB_WIDTH - 1);
 	y = std::clamp(y, 0, DATAROVER_FB_HEIGHT - 1);
-	if (core->pen_x)
-		core->pen_x->set_value(static_cast<ioport_value>((static_cast<uint32_t>(x) * 0xffffU) / 479U));
-	if (core->pen_y)
-		core->pen_y->set_value(static_cast<ioport_value>((static_cast<uint32_t>(y) * 0xffffU) / 319U));
-	if (core->pen_button)
-	{
-		if (button)
-			core->pen_button->set_value(1);
-		else
-			core->pen_button->clear_value();
+	core->last_pen_x = x; core->last_pen_y = y;
+	// Coalesce motion, but retain button transitions between video frames.
+	if (!core->pen_events.empty() && core->pen_events.back().down == button)
+		core->pen_events.back() = {x, y, button};
+	else {
+		if (core->pen_events.size() >= 256) core->pen_events.pop_front();
+		core->pen_events.push_back({x, y, button});
 	}
 }
 
@@ -495,8 +503,7 @@ void teardown_handle(datarover_core *core)
 {
 	if (core->worker.joinable())
 	{
-		if (running_machine *m = core->machine.load(std::memory_order_acquire))
-			m->schedule_exit();
+		core->stop_requested.store(true, std::memory_order_release);
 		core->worker.join();
 	}
 	delete mame_machine_manager::instance();
@@ -530,8 +537,13 @@ const uint8_t *datarover_framebuffer_bytes(void *machine)
 	// where subdevice() is safe).
 	if (s_live.load(std::memory_order_acquire) == core)
 	{
-		m = core->machine.load(std::memory_order_acquire);
-		memintf = core->memintf;
+		// The returned copy belongs to this calling thread. The emulator may
+		// stop or produce another frame without invalidating these bytes.
+		thread_local std::array<uint8_t, DATAROVER_FB_SIZE> snapshot;
+		std::lock_guard<std::mutex> lock(core->mutex);
+		if (!core->active || !core->frame_valid) return nullptr;
+		snapshot = core->frame;
+		return snapshot.data();
 	}
 	else
 	{
@@ -623,64 +635,82 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	{
 		handle->worker = std::thread([handle]()
 		{
-			// The real manager: frame/update paths dereference the singleton.
-			mame_machine_manager *manager = mame_machine_manager::instance(*handle->options, *handle->osd);
-			// run() touches manager->http() unconditionally; the CLI starts
-			// it the same way (clifront.cpp: start_execution).
-			manager->start_http_server();
-			int index = driver_list::find("datarover840");
-			if (index < 0)
-			{
+			auto finished = [handle]() {
 				std::lock_guard<std::mutex> lock(handle->mutex);
-				handle->boot_failed = true;
+				handle->active = false;
+				handle->frame_valid = false;
+				handle->slave_path.clear();
+				handle->pen_events.clear();
+				if (!handle->ready) handle->boot_failed = true;
 				handle->ready = true;
 				handle->ready_cv.notify_all();
-				return;
-			}
+			};
 			try
 			{
+				auto *manager = mame_machine_manager::instance(*handle->options, *handle->osd);
+				manager->start_http_server();
+				int index = driver_list::find("datarover840");
+				if (index < 0) { finished(); return; }
 				machine_config config(driver_list::driver(index), *handle->options);
 				running_machine machine(config, *manager);
-				// Resolve once on the worker thread while the device tree
-				// is stable. Caller threads must never string-lookup.
-				if (device_t *cpu = machine.root_device().subdevice("maincpu"))
-					cpu->interface(handle->memintf);
-				if (ioport_port *px = machine.root_device().ioport("TOUCH_X"))
-					handle->pen_x = px->field(0xffff);
-				if (ioport_port *py = machine.root_device().ioport("TOUCH_Y"))
-					handle->pen_y = py->field(0xffff);
-				if (ioport_port *pb = machine.root_device().ioport("TOUCH_BUTTON"))
-					handle->pen_button = pb->field(0x01);
-				if (device_t *rs = machine.root_device().subdevice("rs2321"))
-				{
-					handle->rs2321_slot = dynamic_cast<device_slot_interface *>(rs);
-					if (handle->rs2321_slot)
-						handle->rs2321_card = handle->rs2321_slot->get_card_device();
-				}
-				handle->machine.store(&machine, std::memory_order_release);
-				{
+				// Match mame_machine_manager::execute: Lua reads the manager's
+				// machine during start(). Unregister before destruction on all exits.
+				manager->set_machine(&machine);
+				struct registration_guard {
+					mame_machine_manager *manager;
+					~registration_guard() { manager->set_machine(nullptr); }
+				} registration{manager};
+				handle->osd->exit_callback = finished;
+				handle->osd->frame_callback = [handle](running_machine &m) {
+					if (handle->stop_requested.load(std::memory_order_acquire)) { m.schedule_exit(); return; }
+					// OSD updates also occur during ROM loading/startup UI. Neither
+					// the address spaces nor input fields are ready at that point.
+					if (m.phase() != machine_phase::RUNNING) return;
+					if (!handle->memintf) {
+						if (auto *cpu = m.root_device().subdevice("maincpu")) cpu->interface(handle->memintf);
+						if (!handle->memintf || !handle->memintf->has_space(AS_PROGRAM)) return;
+						if (auto *port = m.root_device().ioport("TOUCH_X")) handle->pen_x = port->field(0xffff);
+						if (auto *port = m.root_device().ioport("TOUCH_Y")) handle->pen_y = port->field(0xffff);
+						if (auto *port = m.root_device().ioport("TOUCH_BUTTON")) handle->pen_button = port->field(1);
+						if (auto *rs = m.root_device().subdevice("rs2321")) {
+							handle->rs2321_slot = dynamic_cast<device_slot_interface *>(rs);
+							if (handle->rs2321_slot) handle->rs2321_card = handle->rs2321_slot->get_card_device();
+						}
+					}
+					// Apply one queued state per frame so the guest observes both
+					// edges of a quick tap, rather than down and up simultaneously.
+					datarover_core::pen_event event{};
+					bool have_event = false;
+					{
+						std::lock_guard<std::mutex> lock(handle->mutex);
+						if (!handle->pen_events.empty()) {
+							event = handle->pen_events.front();
+							handle->pen_events.pop_front();
+							have_event = true;
+						}
+					}
+					if (have_event) {
+						if (handle->pen_x) handle->pen_x->set_value(uint32_t(event.x) * 0xffffU / 479U);
+						if (handle->pen_y) handle->pen_y->set_value(uint32_t(event.y) * 0xffffU / 319U);
+						if (handle->pen_button) { if (event.down) handle->pen_button->set_value(1); else handle->pen_button->clear_value(); }
+					}
+					auto &space = handle->memintf->space(AS_PROGRAM);
+					uint32_t base = space.read_dword(DINO_MMIO_BASE + DINO_VIDEO_HIGH_BUFFER_OFF) & 0xfffffff0U;
+					if (base > DRAM_LIMIT - DATAROVER_FB_SIZE) base = FALLBACK_BASE;
+					const auto *bytes = static_cast<const uint8_t *>(space.get_read_ptr(base));
+					const auto slave = pty_slave_path(handle->rs2321_slot, handle->rs2321_card);
 					std::lock_guard<std::mutex> lock(handle->mutex);
+					handle->frame_valid = bytes != nullptr;
+					if (bytes) std::copy_n(bytes, handle->frame.size(), handle->frame.begin());
+					handle->slave_path = slave;
+					handle->active = true;
 					handle->ready = true;
-				}
-				handle->ready_cv.notify_all();
-				// Quiet: skip sound recording/startup chatter under the null sink.
+					handle->ready_cv.notify_all();
+				};
 				handle->run_result = machine.run(true);
-				// Invalidate worker-resolved pointers at exit: the device
-				// tree is torn down with run(), so caller threads must see
-				// nulls rather than dangling pointers.
-				handle->memintf = nullptr;
-				handle->pen_x = handle->pen_y = handle->pen_button = nullptr;
-				handle->rs2321_slot = nullptr;
-				handle->rs2321_card = nullptr;
-				handle->machine.store(nullptr, std::memory_order_release);
+				finished();
 			}
-			catch (...)
-			{
-				std::lock_guard<std::mutex> lock(handle->mutex);
-				handle->boot_failed = true;
-				handle->ready = true;
-				handle->ready_cv.notify_all();
-			}
+			catch (...) { finished(); }
 		});
 	}
 	catch (...)
@@ -726,10 +756,7 @@ void datarover_pen_up(void *machine)
 {
 	if (!machine)
 		return;
-	datarover_core *core = static_cast<datarover_core *>(machine);
-	if (!core->machine.load(std::memory_order_acquire) || !core->pen_button)
-		return;
-	core->pen_button->clear_value();
+	inject_pen(static_cast<datarover_core *>(machine), -1, -1, false);
 }
 
 // Package install: port of tools/pclink_send.py main() handshake. The guest
@@ -774,10 +801,10 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	if (!machine || !data || len == 0 || !filename_utf8 || !*filename_utf8)
 		return 1;
 	datarover_core *core = static_cast<datarover_core *>(machine);
-	running_machine *m = core->machine.load(std::memory_order_acquire);
-	if (!m)
-		return 1;
-	const std::string slave = pty_slave_path(core->rs2321_slot, core->rs2321_card);
+	std::string slave;
+	{ std::lock_guard<std::mutex> lock(core->mutex);
+	  if (!core->active) return 1;
+	  slave = core->slave_path; }
 	if (slave.empty())
 		return 1;
 	const int fd = ::open(slave.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);

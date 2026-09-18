@@ -10,10 +10,11 @@ extern "C" {
 #define DATAROVER_FB_HEIGHT 320
 #define DATAROVER_FB_SIZE (480 * 320 / 4)  // 2bpp, matches FRAME_BYTES
 
-// Framebuffer access (valid after machine boot; pointer owned by core).
-// The pointer may be NULL: get_read_ptr() returns NULL for non-RAM-backed
-// mappings (unmapped/ROM/device handlers) and pre-boot, mirroring the
-// scanout power-gated black-fill path. The caller must null-check.
+// For a datarover_create handle, returns a snapshot owned by the calling
+// thread, valid until its next framebuffer call. Returns NULL before a
+// frame is available or after emulation stops. The SDL shim may instead
+// pass a running_machine on its emulation thread and receives live RAM.
+// Callers must null-check and must finish all API calls before destroy.
 const uint8_t *datarover_framebuffer_bytes(void *machine);
 size_t datarover_framebuffer_size(void);
 // Lifecycle + input + package + paths land in Task 2; declared here:
