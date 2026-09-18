@@ -301,9 +301,15 @@ private:
 
 bool invalidate_instruction_cache(void const *start, std::size_t size) noexcept
 {
+#if defined(DATAROVER_IOS_NO_JIT_FLUSH)
+	// iOS device arm64 has no ___clear_cache lowering target and the TX39
+	// is interpreter-only: no generated code ever needs flushing.
+	(void)start; (void)size;
+#else
 	char const *const begin(reinterpret_cast<char const *>(start));
 	char const *const end(begin + size);
 	__builtin___clear_cache(const_cast<char *>(begin), const_cast<char *>(end));
+#endif
 	return true;
 }
 
