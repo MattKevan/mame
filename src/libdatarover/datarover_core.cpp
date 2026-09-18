@@ -516,11 +516,32 @@ const uint8_t *datarover_framebuffer_bytes(void *machine)
 {
 	if (!machine)
 		return nullptr;
+	// Dual-mode tap: datarover_core* (iOS headless, worker-cached devices)
+	// vs running_machine* (SDL parity shim, called on the emulation thread
+	// where subdevice() is safe). Detect by probing the live registry: a
+	// registered datarover_core* handle takes the cached path, anything
+	// else is treated as a direct running_machine pointer.
 	datarover_core *core = static_cast<datarover_core *>(machine);
-	running_machine *const m = core->machine.load(std::memory_order_acquire);
-	if (!m || !core->memintf)
+	running_machine *m = nullptr;
+	device_memory_interface *memintf = nullptr;
+	// A plain load never mutates the registry (compare_exchange would
+	// rewrite s_live on mismatch). Match => core handle; else the caller
+	// passed a running_machine directly (SDL parity shim, emulation thread
+	// where subdevice() is safe).
+	if (s_live.load(std::memory_order_acquire) == core)
+	{
+		m = core->machine.load(std::memory_order_acquire);
+		memintf = core->memintf;
+	}
+	else
+	{
+		m = static_cast<running_machine *>(machine);
+		if (device_t *cpu = m->root_device().subdevice("maincpu"))
+			cpu->interface(memintf);
+	}
+	if (!m || !memintf)
 		return nullptr;
-	address_space &space = core->memintf->space(AS_PROGRAM);
+	address_space &space = memintf->space(AS_PROGRAM);
 	uint32_t base = space.read_dword(DINO_MMIO_BASE + DINO_VIDEO_HIGH_BUFFER_OFF) & 0xffff'fff0U;
 	if (base > (DRAM_LIMIT - DATAROVER_FB_SIZE))
 		base = FALLBACK_BASE;
