@@ -413,6 +413,13 @@ struct datarover_core
 	bool boot_failed = false;
 	std::atomic<running_machine *> machine{ nullptr };
 	int run_result = EMU_ERR_NONE;
+	// Device/interface pointers resolved once on the worker thread after
+	// boot (never string-looked-up on the caller thread: the tagmap
+	// unordered_map races teardown and crashes in its deallocator).
+	device_memory_interface *memintf = nullptr;
+	ioport_field *pen_x = nullptr;
+	ioport_field *pen_y = nullptr;
+	ioport_field *pen_button = nullptr;
 };
 
 // One live handle per process: mame_machine_manager::instance() binds a single
@@ -423,28 +430,23 @@ std::atomic<datarover_core *> s_live{ nullptr };
 // ioport_field::set_value. Guest coords scale to the PORT_MINMAX(0,0xffff)
 // axis exactly like the harness (floor(x * 0xffff / 479)). Analog set_value
 // latches the adjoverride the live read consults, so the value holds until
-// the next pen event — no per-frame refresh.
-void inject_pen(running_machine *m, int x, int y, bool button)
+void inject_pen(datarover_core *core, int x, int y, bool button)
 {
-	if (!m)
+	if (!core || !core->machine.load(std::memory_order_acquire))
 		return;
 	x = std::clamp(x, 0, DATAROVER_FB_WIDTH - 1);
 	y = std::clamp(y, 0, DATAROVER_FB_HEIGHT - 1);
-	device_t &root = m->root_device();
-	if (ioport_port *port = root.ioport("TOUCH_X"))
-		if (ioport_field *field = port->field(0xffff))
-			field->set_value(static_cast<ioport_value>((static_cast<uint32_t>(x) * 0xffffU) / 479U));
-	if (ioport_port *port = root.ioport("TOUCH_Y"))
-		if (ioport_field *field = port->field(0xffff))
-			field->set_value(static_cast<ioport_value>((static_cast<uint32_t>(y) * 0xffffU) / 319U));
-	if (ioport_port *port = root.ioport("TOUCH_BUTTON"))
-		if (ioport_field *field = port->field(0x01))
-		{
-			if (button)
-				field->set_value(1);
-			else
-				field->clear_value();
-		}
+	if (core->pen_x)
+		core->pen_x->set_value(static_cast<ioport_value>((static_cast<uint32_t>(x) * 0xffffU) / 479U));
+	if (core->pen_y)
+		core->pen_y->set_value(static_cast<ioport_value>((static_cast<uint32_t>(y) * 0xffffU) / 319U));
+	if (core->pen_button)
+	{
+		if (button)
+			core->pen_button->set_value(1);
+		else
+			core->pen_button->clear_value();
+	}
 }
 
 // Find the rs2321 PTY slave path through public device APIs only
@@ -518,17 +520,11 @@ const uint8_t *datarover_framebuffer_bytes(void *machine)
 {
 	if (!machine)
 		return nullptr;
-	running_machine *const m = static_cast<running_machine *>(machine);
-	// LCD panel device tag from the driver finder: m_screen(*this, "screen").
-	if (!m->root_device().subdevice("screen"))
+	datarover_core *core = static_cast<datarover_core *>(machine);
+	running_machine *const m = core->machine.load(std::memory_order_acquire);
+	if (!m || !core->memintf)
 		return nullptr;
-	device_t *const cpu = m->root_device().subdevice("maincpu");
-	if (!cpu)
-		return nullptr;
-	device_memory_interface *memintf = nullptr;
-	if (!cpu->interface(memintf) || !memintf->has_space(AS_PROGRAM))
-		return nullptr;
-	address_space &space = memintf->space(AS_PROGRAM);
+	address_space &space = core->memintf->space(AS_PROGRAM);
 	uint32_t base = space.read_dword(DINO_MMIO_BASE + DINO_VIDEO_HIGH_BUFFER_OFF) & 0xffff'fff0U;
 	if (base > (DRAM_LIMIT - DATAROVER_FB_SIZE))
 		base = FALLBACK_BASE;
@@ -566,8 +562,7 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	opts.set_value(OPTION_CONSOLE, 0, prio);
 	opts.set_value(OPTION_DEBUG, 0, prio);
 	opts.set_value(OPTION_THROTTLE, 0, prio);
-	opts.set_value(OPTION_SKIP_GAMEINFO, 1, prio);
-	opts.set_value(OPTION_SECONDS_TO_RUN, 1, prio);
+	opts.set_value(OPTION_SKIP_GAMEINFO, 1, OPTION_PRIORITY_MAXIMUM);
 	// MAXIMUM priority: nothing downstream may re-arm startup screens.
 	opts.set_value(OSDOPTION_VIDEO, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
 	opts.set_value(OSDOPTION_SOUND, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
@@ -605,6 +600,16 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 			{
 				machine_config config(driver_list::driver(index), *handle->options);
 				running_machine machine(config, *manager);
+				// Resolve once on the worker thread while the device tree
+				// is stable. Caller threads must never string-lookup.
+				if (device_t *cpu = machine.root_device().subdevice("maincpu"))
+					cpu->interface(handle->memintf);
+				if (ioport_port *px = machine.root_device().ioport("TOUCH_X"))
+					handle->pen_x = px->field(0xffff);
+				if (ioport_port *py = machine.root_device().ioport("TOUCH_Y"))
+					handle->pen_y = py->field(0xffff);
+				if (ioport_port *pb = machine.root_device().ioport("TOUCH_BUTTON"))
+					handle->pen_button = pb->field(0x01);
 				handle->machine.store(&machine, std::memory_order_release);
 				{
 					std::lock_guard<std::mutex> lock(handle->mutex);
@@ -653,14 +658,14 @@ void datarover_pen_down(void *machine, int x, int y)
 {
 	if (!machine)
 		return;
-	inject_pen(static_cast<datarover_core *>(machine)->machine.load(std::memory_order_acquire), x, y, true);
+	inject_pen(static_cast<datarover_core *>(machine), x, y, true);
 }
 
 void datarover_pen_move(void *machine, int x, int y)
 {
 	if (!machine)
 		return;
-	inject_pen(static_cast<datarover_core *>(machine)->machine.load(std::memory_order_acquire), x, y, true);
+	inject_pen(static_cast<datarover_core *>(machine), x, y, true);
 }
 
 void datarover_pen_up(void *machine)
@@ -668,12 +673,9 @@ void datarover_pen_up(void *machine)
 	if (!machine)
 		return;
 	datarover_core *core = static_cast<datarover_core *>(machine);
-	running_machine *m = core->machine.load(std::memory_order_acquire);
-	if (!m)
+	if (!core->machine.load(std::memory_order_acquire) || !core->pen_button)
 		return;
-	if (ioport_port *port = m->root_device().ioport("TOUCH_BUTTON"))
-		if (ioport_field *field = port->field(0x01))
-			field->clear_value();
+	core->pen_button->clear_value();
 }
 
 // Package install: port of tools/pclink_send.py main() handshake. The guest
