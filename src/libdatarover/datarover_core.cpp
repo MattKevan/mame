@@ -280,9 +280,12 @@ public:
 		machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&core_headless_osd::on_exit, this));
 		// No OSD window exists headless, so no render target is ever
 		// created — but update_and_render derefs ui_target() (render.h:690
-		// asserts non-null) on every frame_update. A hidden target has a
-		// null UI container, which every DUI consumer null-checks.
-		machine.render().target_alloc(nullptr, RENDER_CREATE_HIDDEN);
+		// asserts non-null) and draws into its UI container on every
+		// frame_update. Allocate a plain visible target: it gets a real
+		// UI container, is never presented anywhere, and costs one
+		// container allocation.
+		render_target *target = machine.render().target_alloc(nullptr, 0);
+		target->set_bounds(480, 320, 1.0F);
 	}
 	void update(bool skip_redraw) override { (void)skip_redraw; }
 	void input_update(bool relative_reset) override { (void)relative_reset; }
