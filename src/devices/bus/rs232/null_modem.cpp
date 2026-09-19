@@ -68,6 +68,12 @@ void null_modem_device::device_start()
 	m_timer_poll = timer_alloc(FUNC(null_modem_device::update_queue), this);
 }
 
+void null_modem_device::device_stop()
+{
+	if (m_host_channel)
+		m_host_channel->close();
+}
+
 void null_modem_device::update_serial(int state)
 {
 	int startbits = 1;
@@ -105,7 +111,9 @@ void null_modem_device::update_input_buffer()
 	if (m_input_index == m_input_count)
 	{
 		m_input_index = 0;
-		m_input_count = m_stream->input(m_input_buffer, sizeof(m_input_buffer));
+		m_input_count = m_host_channel
+			? m_host_channel->device_read(m_input_buffer, sizeof(m_input_buffer))
+			: m_stream->input(m_input_buffer, sizeof(m_input_buffer));
 	}
 }
 
@@ -182,6 +190,12 @@ void null_modem_device::rcv_complete()
 	receive_register_extract();
 
 	uint8_t const data = get_received_char();
+	if (m_host_channel)
+	{
+		// The in-process PCLink endpoint carries a binary protocol verbatim.
+		m_host_channel->device_write(data);
+		return;
+	}
 	if (m_flow->read() != 4)
 		m_stream->output(data);
 	else

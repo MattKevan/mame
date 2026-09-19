@@ -8,6 +8,9 @@
 #include "rs232.h"
 #include "imagedev/bitbngr.h"
 #include "diserial.h"
+#include "host_serial.h"
+
+#include <memory>
 
 class null_modem_device : public device_t,
 	public device_serial_interface,
@@ -22,9 +25,20 @@ public:
 
 	void update_serial(int state);
 
+	// Configure on the emulation thread before the machine starts. The host
+	// retains the shared channel and never calls device methods across threads.
+	// Re-applying the serial configuration asserts the control lines the guest
+	// waits for, which only become true once a host channel exists.
+	void set_host_channel(std::shared_ptr<rs232_host_channel> channel)
+	{
+		m_host_channel = std::move(channel);
+		update_serial(0);
+	}
+
 protected:
 	virtual ioport_constructor device_input_ports() const override ATTR_COLD;
 	virtual void device_start() override ATTR_COLD;
+	virtual void device_stop() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
 	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD;
 
@@ -37,6 +51,7 @@ private:
 	void update_input_buffer();
 
 	required_device<bitbanger_device> m_stream;
+	std::shared_ptr<rs232_host_channel> m_host_channel;
 
 	required_ioport m_rs232_txbaud;
 	required_ioport m_rs232_rxbaud;

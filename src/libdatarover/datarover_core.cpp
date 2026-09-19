@@ -28,13 +28,15 @@
 //
 // Package install ports the Python PCLink codec (tools/pclink_send.py:
 // escape/CRC/packet/metadata) to C++ and writes the encoded wire to the
-// guest's UART-A/RS-232 endpoint in-process via the rs2321 PTY card's slave
-// side (docs/pclink.md: Storeroom computer over Dino UART A 19200 8N1,
-// exposed as MAME RS-232 port 1; harness uses -rs2321 pty).
+// guest's UART-A/RS-232 endpoint in-process through rs232_host_channel, which
+// null_modem drains on the emulation thread (docs/pclink.md: Storeroom
+// computer over Dino UART A 19200 8N1, exposed as MAME RS-232 port 1). The
+// same handshake still falls back to the desktop PTY slave when a caller
+// supplies one, so the Linux/macOS CLI harness keeps working.
 //
 // Threading contract: the emulation thread exclusively accesses MAME objects.
-// Caller threads enqueue pen states and read locked framebuffer snapshots or
-// a cached PTY path. destroy() requests exit and joins the worker before freeing
+// Caller threads enqueue pen states and read locked framebuffer snapshots or a
+// cached PTY path. destroy() requests exit and joins the worker before freeing
 // the handle. Callers must finish other API calls before destroy(). Framebuffer
 // snapshots remain valid until the next framebuffer call on that caller thread.
 
@@ -56,6 +58,8 @@
 #include "frontend/mame/ui/menuitem.h"
 #include "render.h"
 #include "fileio.h"
+#include "devices/bus/rs232/host_serial.h"
+#include "devices/bus/rs232/null_modem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -433,6 +437,12 @@ struct datarover_core
 	std::deque<pen_event> pen_events;
 	int last_pen_x = 0, last_pen_y = 0;
 	std::string slave_path;
+	// In-process PCLink transport. Preferred over the PTY slave path wherever
+	// openpty is unavailable (iOS) and used by the native shells on both
+	// platforms; wired into the null_modem card on the emulation thread.
+	std::shared_ptr<rs232_host_channel> host_serial;
+	std::atomic<int> install_progress{ -1 };
+	std::atomic<double> emulated_seconds{ 0.0 };
 	int run_result = EMU_ERR_NONE;
 	// Device/interface pointers resolved once on the worker thread after
 	// boot (never string-looked-up on the caller thread: the tagmap
@@ -640,6 +650,9 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	// reports failure instead of crashing.
 	if (::slot_option *rs2321 = opts.find_slot_option("rs2321"))
 		rs2321->specify("null_modem");
+	// The in-process PCLink channel exists before the machine starts; the card
+	// receives it once the emulation thread has resolved the slot.
+	core->host_serial = std::make_shared<rs232_host_channel>();
 
 	core->checkpoint_path = std::string(cfg_dir && *cfg_dir ? cfg_dir : ".") + "/session.sta";
 	datarover_core *handle = core.release();
@@ -680,6 +693,9 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 				} registration{manager};
 				handle->osd->exit_callback = finished;
 				handle->osd->frame_callback = [handle](running_machine &m) {
+					// Guest-visible schedule source for callers: device
+					// behaviour is defined in emulated time, not host time.
+					handle->emulated_seconds.store(m.time().as_double());
 					if (m.phase() != machine_phase::RUNNING && handle->stop_requested.load()) { m.schedule_exit(); return; }
 					// OSD updates also occur during ROM loading/startup UI. Neither
 					// the address spaces nor input fields are ready at that point.
@@ -741,6 +757,11 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 						if (auto *rs = m.root_device().subdevice("rs2321")) {
 							handle->rs2321_slot = dynamic_cast<device_slot_interface *>(rs);
 							if (handle->rs2321_slot) handle->rs2321_card = handle->rs2321_slot->get_card_device();
+							// Hand the in-process channel to the card on the
+							// emulation thread: the device never looks it up
+							// across threads and no lock covers MAME objects.
+							if (auto *nm = dynamic_cast<null_modem_device *>(handle->rs2321_card))
+								nm->set_host_channel(handle->host_serial);
 						}
 					}
 					const unsigned option = handle->option_mask.load();
@@ -894,6 +915,18 @@ void datarover_pen_up(void *machine)
 // raw PTY mode (configure_raw_pty) and the monotonic deadlines.
 // Returns 0 on observed Pong + GBye write; 1 on any timeout/protocol/IO error.
 namespace {
+// One PCLink conversation needs only three primitives, so the handshake is
+// written once and runs over whichever transport the platform can offer: the
+// in-process channel (all native shells, the only option on iOS) or the
+// desktop PTY slave (the CLI harness).
+struct pclink_link
+{
+	virtual ~pclink_link() = default;
+	virtual bool read_available(std::vector<uint8_t> &out) = 0;
+	virtual bool write_all(const uint8_t *data, size_t len) = 0;
+	virtual void wait(int ms) = 0;
+};
+
 bool read_available_fd(int fd, std::vector<uint8_t> &out)
 {
 	for (;;)
@@ -922,6 +955,60 @@ bool set_raw_fd(int fd)
 	attrs.c_cc[VTIME] = 0;
 	return ::tcsetattr(fd, TCSANOW, &attrs) == 0;
 }
+
+// PTY slave: the desktop harness path.
+struct fd_link : pclink_link
+{
+	explicit fd_link(int fd) : m_fd(fd) {}
+	~fd_link() override { if (m_fd >= 0) ::close(m_fd); }
+	bool read_available(std::vector<uint8_t> &out) override { return read_available_fd(m_fd, out); }
+	bool write_all(const uint8_t *data, size_t len) override { return write_all_fd(m_fd, data, len); }
+	void wait(int ms) override
+	{
+		struct pollfd pfd{ m_fd, POLLIN, 0 };
+		::poll(&pfd, 1, ms);
+	}
+	int m_fd;
+};
+
+// In-process channel: the guest UART drains it from the emulation thread.
+// Writes are nonblocking and can accept a partial buffer, so a full queue is
+// retried until the deadline rather than treated as a device failure.
+struct channel_link : pclink_link
+{
+	explicit channel_link(std::shared_ptr<rs232_host_channel> ch) : m_channel(std::move(ch)) {}
+	bool read_available(std::vector<uint8_t> &out) override
+	{
+		uint8_t buf[65536];
+		for (;;)
+		{
+			const size_t n = m_channel->device_read(buf, sizeof(buf));
+			if (!n)
+				return true;
+			out.insert(out.end(), buf, buf + n);
+		}
+	}
+	bool write_all(const uint8_t *data, size_t len) override
+	{
+		size_t off = 0;
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (off < len)
+		{
+			const size_t n = m_channel->host_write(data + off, len - off);
+			if (n)
+			{
+				off += n;
+				continue;
+			}
+			if (!m_channel->is_open() || std::chrono::steady_clock::now() >= deadline)
+				return false;
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		return true;
+	}
+	void wait(int ms) override { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+	std::shared_ptr<rs232_host_channel> m_channel;
+};
 } // namespace
 int datarover_install_package_named(void *machine, const uint8_t *data, size_t len,
 		const char *filename_utf8)
@@ -929,20 +1016,32 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	if (!machine || !data || len == 0 || !filename_utf8 || !*filename_utf8)
 		return 1;
 	datarover_core *core = static_cast<datarover_core *>(machine);
-	std::string slave;
-	{ std::lock_guard<std::mutex> lock(core->mutex);
-	  if (!core->active) return 1;
-	  slave = core->slave_path; }
-	if (slave.empty())
-		return 1;
-	const int fd = ::open(slave.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-	if (fd < 0)
-		return 1;
-	if (!set_raw_fd(fd))
+	// -1 means "nothing in flight"; the caller polls this while the blocking
+	// handshake below runs on its own thread.
+	auto fail = [core]() { core->install_progress.store(-1); return 1; };
+	core->install_progress.store(0);
+	std::unique_ptr<pclink_link> link;
 	{
-		::close(fd);
-		return 1;
+		std::lock_guard<std::mutex> lock(core->mutex);
+		if (!core->active)
+			return fail();
+		if (core->host_serial)
+		{
+			// A previous transfer may have closed the channel on overflow.
+			core->host_serial->reset();
+			link = std::make_unique<channel_link>(core->host_serial);
+		}
+		else if (!core->slave_path.empty())
+		{
+			const int fd = ::open(core->slave_path.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+			if (fd >= 0 && set_raw_fd(fd))
+				link = std::make_unique<fd_link>(fd);
+			else if (fd >= 0)
+				::close(fd);
+		}
 	}
+	if (!link)
+		return fail();
 	const char kChMa[4] = { 'C', 'h', 'M', 'a' };
 	const char kCnct[4] = { 'C', 'n', 'c', 't' };
 	const char kCntd[4] = { 'C', 'n', 't', 'd' };
@@ -955,11 +1054,8 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	const auto cnct_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
 	for (;;)
 	{
-		if (!read_available_fd(fd, device_wire))
-		{
-			::close(fd);
-			return 1;
-		}
+		if (!link->read_available(device_wire))
+			return fail();
 		if (device_wire.size() >= 4
 			&& std::memcmp(device_wire.data(), kChMa, 4) == 0)
 		{
@@ -973,20 +1069,14 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 			}
 		}
 		if (std::chrono::steady_clock::now() >= cnct_deadline)
-		{
-			::close(fd);
-			return 1;
-		}
-		struct pollfd pfd{ fd, POLLIN, 0 };
-		::poll(&pfd, 1, 50);
+			return fail();
+		link->wait(50);
 	}
+	core->install_progress.store(20);
 	std::vector<uint8_t> cntd = pclink_encode_packet(kCntd, nullptr, 0);
 	cntd.insert(cntd.end(), cntd.begin(), cntd.begin() + cntd.size() / 2);
-	if (!write_all_fd(fd, cntd.data(), cntd.size()))
-	{
-		::close(fd);
-		return 1;
-	}
+	if (!link->write_all(cntd.data(), cntd.size()))
+		return fail();
 	// UTF-8 filename -> UTF-16BE + WinPCLink character count (not byte count).
 	std::vector<uint8_t> name16;
 	uint32_t char_count = 0;
@@ -1012,36 +1102,26 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	}
 	std::vector<uint8_t> meta = pclink_package_metadata(static_cast<uint32_t>(len), name16, char_count);
 	std::vector<uint8_t> meta_wire = pclink_encode_packet(kSPkg, meta.data(), meta.size());
-	if (!write_all_fd(fd, meta_wire.data(), meta_wire.size()))
-	{
-		::close(fd);
-		return 1;
-	}
+	if (!link->write_all(meta_wire.data(), meta_wire.size()))
+		return fail();
+	core->install_progress.store(30);
 	std::vector<uint8_t> stream_in(len + 4, 0);
 	std::memcpy(stream_in.data(), data, len);
 	std::vector<uint8_t> stream = pclink_encode_crc_stream(stream_in.data(), stream_in.size());
-	if (!write_all_fd(fd, stream.data(), stream.size()))
-	{
-		::close(fd);
-		return 1;
-	}
+	if (!link->write_all(stream.data(), stream.size()))
+		return fail();
+	core->install_progress.store(90);
 	std::vector<uint8_t> ping = pclink_encode_packet(kPing, nullptr, 0);
 	std::vector<uint8_t> pong = pclink_encode_packet(kPong, nullptr, 0);
 	std::vector<uint8_t> gbye = pclink_encode_packet(kGBye, nullptr, 0);
-	if (!write_all_fd(fd, ping.data(), ping.size()))
-	{
-		::close(fd);
-		return 1;
-	}
+	if (!link->write_all(ping.data(), ping.size()))
+		return fail();
 	bool pong_seen = false;
 	const auto pong_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
 	for (;;)
 	{
-		if (!read_available_fd(fd, device_wire))
-		{
-			::close(fd);
-			return 1;
-		}
+		if (!link->read_available(device_wire))
+			return fail();
 		if (device_wire.size() > connect_len
 			&& std::search(device_wire.begin() + connect_len, device_wire.end(),
 				pong.begin(), pong.end()) != device_wire.end())
@@ -1051,17 +1131,28 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 		}
 		if (std::chrono::steady_clock::now() >= pong_deadline)
 			break;
-		struct pollfd pfd{ fd, POLLIN, 0 };
-		::poll(&pfd, 1, 50);
+		link->wait(50);
 	}
 	if (!pong_seen)
-	{
-		::close(fd);
-		return 1;
-	}
-	const bool ok = write_all_fd(fd, gbye.data(), gbye.size());
-	::close(fd);
-	return ok ? 0 : 1;
+		return fail();
+	if (!link->write_all(gbye.data(), gbye.size()))
+		return fail();
+	core->install_progress.store(100);
+	return 0;
+}
+
+int datarover_install_progress(void *machine)
+{
+	if (!machine)
+		return -1;
+	return static_cast<datarover_core *>(machine)->install_progress.load();
+}
+
+double datarover_emulated_seconds(void *machine)
+{
+	if (!machine)
+		return 0.0;
+	return static_cast<datarover_core *>(machine)->emulated_seconds.load();
 }
 
 int datarover_install_package(void *machine, const uint8_t *data, size_t len)

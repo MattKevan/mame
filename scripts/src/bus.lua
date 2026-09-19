@@ -4923,6 +4923,7 @@ if BUSES["RS232"] then
 		MAME_DIR .. "src/devices/bus/rs232/heath_h19.h",
 		MAME_DIR .. "src/devices/bus/rs232/hlemouse.cpp",
 		MAME_DIR .. "src/devices/bus/rs232/hlemouse.h",
+		MAME_DIR .. "src/devices/bus/rs232/host_serial.h",
 		MAME_DIR .. "src/devices/bus/rs232/ie15.cpp",
 		MAME_DIR .. "src/devices/bus/rs232/ie15.h",
 		MAME_DIR .. "src/devices/bus/rs232/keyboard.cpp",

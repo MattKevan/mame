@@ -38,6 +38,14 @@ int datarover_install_package(void *machine, const uint8_t *data, size_t len);
 // Character count (not byte count) is recorded per WinPCLink; non-ASCII
 // names are encoded UTF-16BE with a proper character count.
 int datarover_install_package_named(void *machine, const uint8_t *data, size_t len, const char *filename_utf8);
+// Progress of the install running on the calling thread: 0-100, or -1 when no
+// install is in flight. Phase-granular (handshake, metadata, stream, reply),
+// so a UI can show meaningful movement during a multi-minute transfer.
+int datarover_install_progress(void *machine);
+// Emulated seconds since the machine started (0 before the first frame). Guest
+// behaviour is scheduled in emulated time, so regressions and any guest clock
+// work must use this rather than host wall time.
+double datarover_emulated_seconds(void *machine);
 
 #ifdef __cplusplus
 }
