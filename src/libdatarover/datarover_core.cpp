@@ -55,12 +55,14 @@
 #include "dislot.h"
 #include "frontend/mame/ui/menuitem.h"
 #include "render.h"
+#include "fileio.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <functional>
 #include <deque>
+#include <sstream>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -414,6 +416,16 @@ struct datarover_core
 	bool ready = false;
 	bool boot_failed = false;
 	std::atomic<bool> stop_requested{ false };
+	std::atomic<bool> paused{ false }, save_requested{ false }, restart_requested{ false };
+	std::atomic<int> save_status{ 0 };
+	std::atomic<unsigned> option_mask{ 0 };
+	std::atomic<uint64_t> frame_revision{ 0 };
+	std::condition_variable control_cv;
+	std::string checkpoint_path;
+	bool restore_attempted = false;
+	unsigned applied_option = 0;
+	ioport_field *option_button = nullptr;
+	std::chrono::steady_clock::time_point last_checkpoint = std::chrono::steady_clock::now();
 	bool active = false;
 	bool frame_valid = false;
 	std::array<uint8_t, DATAROVER_FB_SIZE> frame{};
@@ -503,7 +515,11 @@ void teardown_handle(datarover_core *core)
 {
 	if (core->worker.joinable())
 	{
-		core->stop_requested.store(true, std::memory_order_release);
+		{
+			std::lock_guard<std::mutex> lock(core->mutex);
+			core->stop_requested.store(true, std::memory_order_release);
+		}
+		core->control_cv.notify_all();
 		core->worker.join();
 	}
 	delete mame_machine_manager::instance();
@@ -604,13 +620,14 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	}
 	// Headless defaults matching the regression harness (-video none -sound
 	// none, no INI side effects, no Lua/plugins/debugger, no UI pauses,
-	// unthrottled free-run paced by the caller).
+	// real-time emulation with sleeping between frames).
 	opts.set_value(OPTION_READCONFIG, 0, prio);
 	opts.set_value(OPTION_WRITECONFIG, 0, prio);
 	opts.set_value(OPTION_PLUGINS, 0, prio);
 	opts.set_value(OPTION_CONSOLE, 0, prio);
 	opts.set_value(OPTION_DEBUG, 0, prio);
-	opts.set_value(OPTION_THROTTLE, 0, prio);
+	opts.set_value(OPTION_THROTTLE, 1, prio);
+	opts.set_value(OPTION_SLEEP, 1, prio);
 	opts.set_value(OPTION_SKIP_GAMEINFO, 1, OPTION_PRIORITY_MAXIMUM);
 	// MAXIMUM priority: nothing downstream may re-arm startup screens.
 	opts.set_value(OSDOPTION_VIDEO, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
@@ -624,6 +641,7 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	if (::slot_option *rs2321 = opts.find_slot_option("rs2321"))
 		rs2321->specify("null_modem");
 
+	core->checkpoint_path = std::string(cfg_dir && *cfg_dir ? cfg_dir : ".") + "/session.sta";
 	datarover_core *handle = core.release();
 	datarover_core *expected = nullptr;
 	if (!s_live.compare_exchange_strong(expected, handle, std::memory_order_acq_rel))
@@ -662,13 +680,61 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 				} registration{manager};
 				handle->osd->exit_callback = finished;
 				handle->osd->frame_callback = [handle](running_machine &m) {
-					if (handle->stop_requested.load(std::memory_order_acquire)) { m.schedule_exit(); return; }
+					if (m.phase() != machine_phase::RUNNING && handle->stop_requested.load()) { m.schedule_exit(); return; }
 					// OSD updates also occur during ROM loading/startup UI. Neither
 					// the address spaces nor input fields are ready at that point.
 					if (m.phase() != machine_phase::RUNNING) return;
+					if (!handle->restore_attempted) {
+						handle->restore_attempted = true;
+						emu_file file(OPEN_FLAG_READ);
+						if (!file.open(handle->checkpoint_path)) {
+							// Keep a rollback image: a truncated save must not leave
+							// half-restored guest RAM or device state behind.
+							std::stringstream backup(std::ios::in | std::ios::out | std::ios::binary);
+							if (m.save().write_stream(backup) == STATERR_NONE
+								&& m.save().read_file(file) != STATERR_NONE) {
+								backup.seekg(0);
+								m.save().read_stream(backup);
+							}
+						}
+					}
+					if (handle->paused.load() || handle->stop_requested.load()) {
+						// Never checkpoint a finger or Option control held down.
+						if (handle->option_button) handle->option_button->clear_value();
+						if (handle->pen_button) handle->pen_button->clear_value();
+						handle->applied_option = 0;
+						std::lock_guard<std::mutex> lock(handle->mutex);
+						handle->pen_events.clear();
+					}
+					const auto now = std::chrono::steady_clock::now();
+					if (handle->save_requested.load() || handle->stop_requested.load()
+						|| now - handle->last_checkpoint > std::chrono::seconds(60)) {
+						if (m.scheduler().can_save()) {
+							handle->save_requested.store(false);
+							const auto temporary = handle->checkpoint_path + ".tmp";
+							emu_file file(OPEN_FLAG_WRITE | OPEN_FLAG_CREATE | OPEN_FLAG_CREATE_PATHS);
+							bool ok = !file.open(temporary);
+							if (ok) ok = m.save().write_file(file) == STATERR_NONE;
+							file.close();
+							if (ok) ok = ::rename(temporary.c_str(), handle->checkpoint_path.c_str()) == 0;
+							handle->last_checkpoint = now;
+							handle->save_status.store(ok ? 2 : -1);
+						}
+					}
+					if (handle->stop_requested.load()) { m.schedule_exit(); return; }
+					if (handle->restart_requested.exchange(false)) m.schedule_soft_reset();
+					if (handle->paused.load() && !handle->save_requested.load()) {
+						std::unique_lock<std::mutex> lock(handle->mutex);
+						handle->control_cv.wait(lock, [handle] {
+							return !handle->paused.load() || handle->stop_requested.load()
+								|| handle->save_requested.load() || handle->restart_requested.load();
+						});
+						return;
+					}
 					if (!handle->memintf) {
 						if (auto *cpu = m.root_device().subdevice("maincpu")) cpu->interface(handle->memintf);
 						if (!handle->memintf || !handle->memintf->has_space(AS_PROGRAM)) return;
+						if (auto *port = m.root_device().ioport("OPTION_BUTTON")) handle->option_button = port->field(1);
 						if (auto *port = m.root_device().ioport("TOUCH_X")) handle->pen_x = port->field(0xffff);
 						if (auto *port = m.root_device().ioport("TOUCH_Y")) handle->pen_y = port->field(0xffff);
 						if (auto *port = m.root_device().ioport("TOUCH_BUTTON")) handle->pen_button = port->field(1);
@@ -676,6 +742,12 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 							handle->rs2321_slot = dynamic_cast<device_slot_interface *>(rs);
 							if (handle->rs2321_slot) handle->rs2321_card = handle->rs2321_slot->get_card_device();
 						}
+					}
+					const unsigned option = handle->option_mask.load();
+					if (option != handle->applied_option && handle->option_button) {
+						if (option) handle->option_button->set_value(1);
+						else handle->option_button->clear_value();
+						handle->applied_option = option;
 					}
 					// Apply one queued state per frame so the guest observes both
 					// edges of a quick tap, rather than down and up simultaneously.
@@ -701,7 +773,10 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 					const auto slave = pty_slave_path(handle->rs2321_slot, handle->rs2321_card);
 					std::lock_guard<std::mutex> lock(handle->mutex);
 					handle->frame_valid = bytes != nullptr;
-					if (bytes) std::copy_n(bytes, handle->frame.size(), handle->frame.begin());
+					if (bytes && (handle->frame_revision.load() == 0 || std::memcmp(bytes, handle->frame.data(), handle->frame.size()) != 0)) {
+						std::copy_n(bytes, handle->frame.size(), handle->frame.begin());
+						handle->frame_revision.fetch_add(1);
+					}
 					handle->slave_path = slave;
 					handle->active = true;
 					handle->ready = true;
@@ -729,6 +804,59 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 		}
 	}
 	return handle;
+}
+
+void datarover_set_option(void *machine, int side, int pressed)
+{
+	if (!machine || side < 0 || side > 1) return;
+	auto *core = static_cast<datarover_core *>(machine);
+	if (pressed) core->option_mask.fetch_or(1U << side);
+	else core->option_mask.fetch_and(~(1U << side));
+}
+void datarover_request_save(void *machine)
+{
+	if (!machine) return;
+	auto *core = static_cast<datarover_core *>(machine);
+	{
+		std::lock_guard<std::mutex> lock(core->mutex);
+		core->save_status.store(1);
+		core->save_requested.store(true);
+	}
+	core->control_cv.notify_all();
+}
+void datarover_set_paused(void *machine, int paused)
+{
+	if (!machine) return;
+	auto *core = static_cast<datarover_core *>(machine);
+	if (paused) inject_pen(core, -1, -1, false);
+	{
+		std::lock_guard<std::mutex> lock(core->mutex);
+		if (paused) {
+			core->option_mask.store(0);
+			core->save_status.store(1);
+			core->save_requested.store(true);
+		}
+		core->paused.store(paused != 0);
+	}
+	core->control_cv.notify_all();
+}
+int datarover_save_status(void *machine)
+{
+	return machine ? static_cast<datarover_core *>(machine)->save_status.load() : -1;
+}
+uint64_t datarover_frame_revision(void *machine)
+{
+	return machine ? static_cast<datarover_core *>(machine)->frame_revision.load() : 0;
+}
+void datarover_restart(void *machine)
+{
+	if (!machine) return;
+	auto *core = static_cast<datarover_core *>(machine);
+	{
+		std::lock_guard<std::mutex> lock(core->mutex);
+		core->restart_requested.store(true);
+	}
+	core->control_cv.notify_all();
 }
 
 void datarover_destroy(void *machine)

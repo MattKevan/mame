@@ -20,6 +20,16 @@ size_t datarover_framebuffer_size(void);
 // Lifecycle + input + package + paths land in Task 2; declared here:
 void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *rom_path);
 void datarover_destroy(void *machine);
+
+// Thread-safe controls; changes are applied by the emulation worker.
+void datarover_set_option(void *machine, int side, int pressed);
+void datarover_set_paused(void *machine, int paused);
+void datarover_request_save(void *machine);
+// 0: not saved, 1: pending, 2: saved, -1: failed.
+int datarover_save_status(void *machine);
+uint64_t datarover_frame_revision(void *machine);
+void datarover_restart(void *machine);
+
 void datarover_pen_down(void *machine, int x, int y);
 void datarover_pen_move(void *machine, int x, int y);
 void datarover_pen_up(void *machine);

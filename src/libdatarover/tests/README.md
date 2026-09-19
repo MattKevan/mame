@@ -26,3 +26,12 @@ The test uses its own NVRAM/config directory and does not change app data.
 A crash, nonzero exit, or hang is a failure; use a 180-second outer timeout in CI.
 The test stresses input delivery but does not assert guest-visible tap behavior;
 check that interactively in the app.
+
+## Controls and checkpoints
+
+Compile `controls.cpp` using the same command and library as above, replacing
+`lifecycle.cpp` and the output executable name. Pass the ROM and a fresh scratch
+directory. It checks pause CPU usage, stable paused frames, checkpoint creation,
+restart, reload, shutdown while paused and corrupt-checkpoint fallback. Expected:
+`PASS controls, pause, checkpoint, restart, resume and corrupt-save fallback`.
+The test does not assert the guest-visible effect of the Option controls.
