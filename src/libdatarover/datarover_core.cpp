@@ -64,6 +64,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <fstream>
 #include <functional>
 #include <deque>
 #include <sstream>
@@ -173,10 +174,40 @@ struct pclink_packet
 	char tag[4];
 	std::vector<uint8_t> payload;
 };
-bool pclink_decode_packet(const uint8_t *wire, size_t wire_len, pclink_packet &out)
+// Unescapes an encoded prefix. Returns 1 when the data ends mid-escape pair
+// (more frames are needed), -1 on an invalid escape, 0 on success.
+int unescape_stream(const std::vector<uint8_t> &encoded, std::vector<uint8_t> &stream)
+{
+	bool escaped = false;
+	stream.clear();
+	stream.reserve(encoded.size());
+	for (uint8_t v : encoded)
+	{
+		if (escaped)
+		{
+			if (v != 0x0e && v != 0x0f && v != 0x10)
+				return -1;
+			stream.push_back(v);
+			escaped = false;
+		}
+		else if (v == 0x10)
+			escaped = true;
+		else if (v == 0x0e || v == 0x0f)
+			return -1;
+		else
+			stream.push_back(v);
+	}
+	return escaped ? 1 : 0;
+}
+
+// Decodes the FIRST complete packet in `wire`, reporting how many wire bytes it
+// consumed. Trailing data is expected: the guest retries its connect request,
+// and every retry it sent before the host started is already queued.
+bool pclink_decode_packet(const uint8_t *wire, size_t wire_len, pclink_packet &out,
+		size_t &consumed)
 {
 	std::vector<uint8_t> encoded;
-	encoded.reserve(wire_len);
+	std::vector<uint8_t> stream;
 	size_t pos = 0;
 	while (pos < wire_len)
 	{
@@ -201,37 +232,24 @@ bool pclink_decode_packet(const uint8_t *wire, size_t wire_len, pclink_packet &o
 			return false;
 		encoded.insert(encoded.end(), wire + pos, wire + pos + size);
 		pos += size + 4;
-	}
-	bool escaped = false;
-	std::vector<uint8_t> stream;
-	stream.reserve(encoded.size());
-	for (uint8_t v : encoded)
-	{
-		if (escaped)
-		{
-			if (v != 0x0e && v != 0x0f && v != 0x10)
-				return false;
-			stream.push_back(v);
-			escaped = false;
-		}
-		else if (v == 0x10)
-			escaped = true;
-		else if (v == 0x0e || v == 0x0f)
+
+		const int unescaped = unescape_stream(encoded, stream);
+		if (unescaped < 0)
 			return false;
-		else
-			stream.push_back(v);
+		if (unescaped > 0 || stream.size() < 8)
+			continue;
+		const size_t declared = (static_cast<size_t>(stream[4]) << 24)
+			| (static_cast<size_t>(stream[5]) << 16)
+			| (static_cast<size_t>(stream[6]) << 8)
+			| stream[7];
+		if (stream.size() < declared + 8)
+			continue;
+		std::memcpy(out.tag, stream.data(), 4);
+		out.payload.assign(stream.begin() + 8, stream.begin() + declared + 8);
+		consumed = pos;
+		return true;
 	}
-	if (escaped || stream.size() < 8)
-		return false;
-	const size_t declared = (static_cast<size_t>(stream[4]) << 24)
-		| (static_cast<size_t>(stream[5]) << 16)
-		| (static_cast<size_t>(stream[6]) << 8)
-		| stream[7];
-	if (stream.size() != declared + 8)
-		return false;
-	std::memcpy(out.tag, stream.data(), 4);
-	out.payload.assign(stream.begin() + 8, stream.end());
-	return true;
+	return false;
 }
 
 std::vector<uint8_t> pclink_encode_packet(const char tag[4], const uint8_t *payload, size_t payload_len)
@@ -483,6 +501,33 @@ void inject_pen(datarover_core *core, int x, int y, bool button)
 	}
 }
 
+// The guest only offers PCLink when it sees a Magic Bus accessory: without it
+// the Storeroom computer reports "can't link to a computer" and never writes a
+// byte, so no handshake can start. Seed the input configuration once so an app
+// container behaves like the regression harness, which configures exactly this
+// entry (tools/pclink_regression.py). MAME reads the game config independently
+// of OPTION_READCONFIG, which only governs INI files.
+void seed_magicbus_config(const char *cfg_dir)
+{
+	if (!cfg_dir || !*cfg_dir)
+		return;
+	const std::string path = std::string(cfg_dir) + "/datarover840.cfg";
+	struct stat st{};
+	if (::stat(path.c_str(), &st) == 0)
+		return;
+	std::ofstream out(path);
+	if (!out)
+		return;
+	out << "<?xml version=\"1.0\"?>\n"
+		"<mameconfig version=\"10\">\n"
+		"    <system name=\"datarover840\">\n"
+		"        <input>\n"
+		"            <port tag=\":MAGICBUS_ACCESSORY\" type=\"CONFIG\" mask=\"1\" defvalue=\"1\" value=\"1\" />\n"
+		"        </input>\n"
+		"    </system>\n"
+		"</mameconfig>\n";
+}
+
 // The caller passes the boot-cached slot + card: resolving "rs2321" via
 // subdevice() on the caller thread races device-tree teardown
 // (unordered_map deallocator) and faults exactly like the framebuffer path.
@@ -606,6 +651,7 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 		opts.set_value(OPTION_NVRAM_DIRECTORY, nvram_dir, prio);
 	if (cfg_dir && *cfg_dir)
 		opts.set_value(OPTION_CFG_DIRECTORY, cfg_dir, prio);
+	seed_magicbus_config(cfg_dir);
 	if (rom_path && *rom_path)
 	{
 		// OPTION_MEDIAPATH is a semicolon-separated search DIRECTORY list:
@@ -982,7 +1028,9 @@ struct channel_link : pclink_link
 		uint8_t buf[65536];
 		for (;;)
 		{
-			const size_t n = m_channel->device_read(buf, sizeof(buf));
+			// host_read drains the device→host queue; device_read would drain
+			// the queue this side writes into.
+			const size_t n = m_channel->host_read(buf, sizeof(buf));
 			if (!n)
 				return true;
 			out.insert(out.end(), buf, buf + n);
@@ -1027,8 +1075,11 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 			return fail();
 		if (core->host_serial)
 		{
-			// A previous transfer may have closed the channel on overflow.
-			core->host_serial->reset();
+			// Reopen only a channel a previous transfer closed. A live channel
+			// must keep its queue: the guest speaks first and its connect
+			// request can already be waiting before the host starts.
+			if (!core->host_serial->is_open())
+				core->host_serial->reset();
 			link = std::make_unique<channel_link>(core->host_serial);
 		}
 		else if (!core->slave_path.empty())
@@ -1050,7 +1101,6 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	const char kPong[4] = { 'P', 'o', 'n', 'g' };
 	const char kGBye[4] = { 'G', 'B', 'y', 'e' };
 	std::vector<uint8_t> device_wire;
-	size_t connect_len = 0;
 	const auto cnct_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
 	for (;;)
 	{
@@ -1060,21 +1110,39 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 			&& std::memcmp(device_wire.data(), kChMa, 4) == 0)
 		{
 			pclink_packet pkt;
+			size_t consumed = 0;
 			if (pclink_decode_packet(device_wire.data() + 4,
-					device_wire.size() - 4, pkt)
+					device_wire.size() - 4, pkt, consumed)
 				&& std::memcmp(pkt.tag, kCnct, 4) == 0)
 			{
-				connect_len = device_wire.size();
+				// Drop the consumed request and keep whatever follows it.
+				device_wire.erase(device_wire.begin(),
+						device_wire.begin() + 4 + consumed);
 				break;
 			}
+		}
+		else
+		{
+			// Bytes can predate this transfer (the guest opens the link when
+			// the user reaches the Storeroom computer, which may be before the
+			// host is asked to install). Resynchronise on the guest's magic
+			// instead of demanding it at offset zero.
+			const auto magic = std::search(device_wire.begin(), device_wire.end(),
+					kChMa, kChMa + 4);
+			if (magic != device_wire.end())
+				device_wire.erase(device_wire.begin(), magic);
 		}
 		if (std::chrono::steady_clock::now() >= cnct_deadline)
 			return fail();
 		link->wait(50);
 	}
 	core->install_progress.store(20);
-	std::vector<uint8_t> cntd = pclink_encode_packet(kCntd, nullptr, 0);
-	cntd.insert(cntd.end(), cntd.begin(), cntd.begin() + cntd.size() / 2);
+	// WinPCLink sends this acknowledgement twice and Magic Cap requires both,
+	// as complete packets (see the CLI harness's host-wire.bin). Duplicating
+	// via a self-referential insert would be undefined, so copy first.
+	const std::vector<uint8_t> cntd_once = pclink_encode_packet(kCntd, nullptr, 0);
+	std::vector<uint8_t> cntd = cntd_once;
+	cntd.insert(cntd.end(), cntd_once.begin(), cntd_once.end());
 	if (!link->write_all(cntd.data(), cntd.size()))
 		return fail();
 	// UTF-8 filename -> UTF-16BE + WinPCLink character count (not byte count).
@@ -1122,8 +1190,7 @@ int datarover_install_package_named(void *machine, const uint8_t *data, size_t l
 	{
 		if (!link->read_available(device_wire))
 			return fail();
-		if (device_wire.size() > connect_len
-			&& std::search(device_wire.begin() + connect_len, device_wire.end(),
+		if (std::search(device_wire.begin(), device_wire.end(),
 				pong.begin(), pong.end()) != device_wire.end())
 		{
 			pong_seen = true;

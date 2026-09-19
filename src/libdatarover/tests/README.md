@@ -35,3 +35,25 @@ directory. It checks pause CPU usage, stable paused frames, checkpoint creation,
 restart, reload, shutdown while paused and corrupt-checkpoint fallback. Expected:
 `PASS controls, pause, checkpoint, restart, resume and corrupt-save fallback`.
 The test does not assert the guest-visible effect of the Option controls.
+
+## In-process package install
+
+Compile `install.cpp` the same way. It takes three arguments — ROM, a fresh
+scratch directory, and a `.pkg` — and drives the guest the way the CLI harness
+does: welcome tap, the three calibration targets, then the Hallway and
+Storeroom. It starts the host-side install *before* tapping the Storeroom
+computer, because that tap is what makes the guest send its `ChMa`/`Cnct`
+opening exchange (docs/pclink.md).
+
+```sh
+xcrun simctl spawn "$SIMULATOR_ID" /tmp/datarover-install \
+  "$ROM_PATH" "$(mktemp -d /tmp/datarover-install.XXXXXX)" "$PACKAGE"
+```
+
+Expected: `PASS in-process PCLink package install`, exit status zero, about a
+minute, with the package counted in the guest's Storeroom storage. A fresh
+scratch directory also proves the core seeds the Magic Bus accessory
+configuration the guest needs before it will open a link at all; without that
+seed the guest never transmits and the test fails after a 180-second timeout.
+The test writes `shot-<frame>.raw` snapshots (480x320 2bpp) into the scratch
+directory for failures, and destroys its own emulator state.
