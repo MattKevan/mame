@@ -49,6 +49,8 @@
 #include "frontend/mame/mame.h"
 #include "emuopts.h"
 #include "modules/lib/osdobj_common.h"
+#include "modules/netdev/netdev_module.h"
+#include "modules/osdmodule.h"
 #include "drivenum.h"
 #include "gamedrv.h"
 #include "mconfig.h"
@@ -82,6 +84,10 @@
 #include <unistd.h>
 
 GAME_EXTERN(datarover840);
+
+#if defined(OSD_NET_USE_SLIRP)
+extern const module_type NETDEV_SLIRP;
+#endif
 
 namespace {
 
@@ -296,14 +302,36 @@ std::vector<uint8_t> pclink_package_metadata(uint32_t size, const std::vector<ui
 class core_headless_osd : public osd_interface
 {
 public:
-	core_headless_osd() = default;
+	core_headless_osd(osd_options &options, bool network_enabled, bool audio_enabled)
+		: m_options(options), m_network_enabled(network_enabled), m_audio_enabled(audio_enabled) { }
+	~core_headless_osd() override { m_modules.exit(); }
 	std::function<void(running_machine &)> frame_callback;
 	std::function<void()> exit_callback;
+	std::function<void(int)> network_status_callback;
 
 	void init(running_machine &machine) override
 	{
 		m_machine = &machine;
 		machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&core_headless_osd::on_exit, this));
+		if (m_network_enabled)
+		{
+#if defined(OSD_NET_USE_SLIRP)
+			try
+			{
+				m_modules.register_module(NETDEV_SLIRP);
+				m_network = &m_modules.select_module<osd::netdev_module>(
+						*this, m_options, OSD_NETDEV_PROVIDER, "slirp");
+			}
+			catch (...)
+			{
+				m_network = nullptr;
+			}
+			if (network_status_callback) network_status_callback(m_network ? 1 : -1);
+#else
+			osd_printf_error("DataRover network requested but libslirp support was not built\n");
+			if (network_status_callback) network_status_callback(-1);
+#endif
+		}
 		// No OSD window exists headless, so no render target is ever
 		// created — but update_and_render derefs ui_target() (render.h:690
 		// asserts non-null) and draws into its UI container on every
@@ -325,7 +353,7 @@ public:
 		(void)firststop;
 	}
 
-	bool no_sound() override { return true; }
+	bool no_sound() override { return !m_audio_enabled; }
 	bool sound_external_per_channel_volume() override { return false; }
 	bool sound_split_streams_per_source() override { return false; }
 	uint32_t sound_get_generation() override { return 1; }
@@ -333,8 +361,21 @@ public:
 	{
 		osd::audio_info info;
 		info.m_generation = 1;
-		info.m_default_sink = 0;
+		info.m_default_sink = m_audio_enabled ? 1 : 0;
 		info.m_default_source = 0;
+		if (m_audio_enabled)
+		{
+			osd::audio_info::node_info sink;
+			sink.m_name = "DataRover";
+			sink.m_display_name = "DataRover Speaker";
+			sink.m_id = 1;
+			sink.m_rate = { 48'000, 48'000, 48'000 };
+			sink.m_port_names.emplace_back("Front Center");
+			sink.m_port_positions.emplace_back(osd::channel_position::FC());
+			sink.m_sinks = 1;
+			sink.m_sources = 0;
+			info.m_nodes.emplace_back(std::move(sink));
+		}
 		return info;
 	}
 	uint32_t sound_stream_sink_open(uint32_t node, std::string name, uint32_t rate) override
@@ -342,7 +383,7 @@ public:
 		(void)node;
 		(void)name;
 		(void)rate;
-		return 0;
+		return m_audio_enabled ? 1 : 0;
 	}
 	uint32_t sound_stream_source_open(uint32_t node, std::string name, uint32_t rate) override
 	{
@@ -354,9 +395,8 @@ public:
 	void sound_stream_close(uint32_t id) override { (void)id; }
 	void sound_stream_sink_update(uint32_t id, const int16_t *buffer, int samples_this_frame) override
 	{
-		(void)id;
-		(void)buffer;
-		(void)samples_this_frame;
+		if (m_audio_enabled && id == 1 && m_audio_write)
+			m_audio_write(buffer, size_t(std::max(samples_this_frame, 0)));
 	}
 	void sound_stream_source_update(uint32_t id, int16_t *buffer, int samples_this_frame) override
 	{
@@ -412,20 +452,65 @@ public:
 
 	std::unique_ptr<osd::network_device> open_network_device(int id, osd::network_handler &handler) override
 	{
-		(void)id;
-		(void)handler;
-		return nullptr;
+		return m_network_enabled && m_network ? m_network->open_device(id, handler) : nullptr;
 	}
 	std::vector<osd::network_device_info> list_network_devices() override
 	{
-		return std::vector<osd::network_device_info>();
+		return m_network_enabled && m_network ? m_network->list_devices() : std::vector<osd::network_device_info>();
+	}
+	void set_audio_writer(std::function<void(const int16_t *, size_t)> writer)
+	{
+		m_audio_write = std::move(writer);
 	}
 
 private:
-	void on_exit() { if (exit_callback) exit_callback(); m_machine = nullptr; }
+	void on_exit() { m_modules.exit(); m_network = nullptr; if (exit_callback) exit_callback(); m_machine = nullptr; }
 
+	osd_options &m_options;
+	bool m_network_enabled;
+	bool m_audio_enabled;
+	osd_module_manager m_modules;
+	osd::netdev_module *m_network = nullptr;
+	std::function<void(const int16_t *, size_t)> m_audio_write;
 	running_machine *m_machine = nullptr;
 	bool m_verbose = false;
+};
+
+struct pcm_ring
+{
+	static constexpr size_t capacity = 96'000; // two seconds at 48 kHz
+	std::array<int16_t, capacity> samples{};
+	std::atomic<uint64_t> read_index{ 0 };
+	std::atomic<uint64_t> write_index{ 0 };
+
+	void push(const int16_t *source, size_t frames)
+	{
+		if (!source) return;
+		uint64_t const write = write_index.load(std::memory_order_relaxed);
+		uint64_t const read = read_index.load(std::memory_order_acquire);
+		size_t const available = capacity - size_t(std::min<uint64_t>(write - read, capacity));
+		size_t const count = std::min(frames, available);
+		for (size_t index = 0; index < count; ++index)
+			samples[(write + index) % capacity] = source[index];
+		write_index.store(write + count, std::memory_order_release);
+	}
+
+	size_t pop(int16_t *destination, size_t frames)
+	{
+		if (!destination) return 0;
+		uint64_t const read = read_index.load(std::memory_order_relaxed);
+		uint64_t const write = write_index.load(std::memory_order_acquire);
+		size_t const count = std::min<uint64_t>(frames, write - read);
+		for (size_t index = 0; index < count; ++index)
+			destination[index] = samples[(read + index) % capacity];
+		read_index.store(read + count, std::memory_order_release);
+		return count;
+	}
+
+	void clear()
+	{
+		read_index.store(write_index.load(std::memory_order_acquire), std::memory_order_release);
+	}
 };
 
 struct datarover_core
@@ -442,6 +527,8 @@ struct datarover_core
 	std::atomic<int> save_status{ 0 };
 	std::atomic<unsigned> option_mask{ 0 };
 	std::atomic<uint64_t> frame_revision{ 0 };
+	std::atomic<int> network_status{ 0 };
+	pcm_ring audio;
 	std::condition_variable control_cv;
 	std::string checkpoint_path;
 	bool restore_attempted = false;
@@ -631,11 +718,17 @@ const uint8_t *datarover_framebuffer_bytes(void *machine)
 	return static_cast<const uint8_t *>(space.get_read_ptr(base));
 }
 
-void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *rom_path)
+void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, const char *rom_path,
+		const datarover_create_options *create_options)
 {
+	const bool network_enabled = create_options
+			&& create_options->struct_size >= sizeof(datarover_create_options)
+			&& create_options->network_enabled;
+	const bool audio_enabled = create_options
+			&& create_options->struct_size >= sizeof(datarover_create_options)
+			&& create_options->audio_output_enabled;
 	auto core = std::make_unique<datarover_core>();
 	core->options = std::make_unique<osd_options>();
-	core->osd = std::make_unique<core_headless_osd>();
 
 	emu_options &opts = *core->options;
 	try
@@ -688,6 +781,15 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	// MAXIMUM priority: nothing downstream may re-arm startup screens.
 	opts.set_value(OSDOPTION_VIDEO, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
 	opts.set_value(OSDOPTION_SOUND, OSDOPTVAL_NONE, OPTION_PRIORITY_MAXIMUM);
+	if (network_enabled)
+	{
+		opts.set_value("networkprovider", "slirp", prio);
+		if (::slot_option *ethernet = opts.find_slot_option("pccard1"))
+			ethernet->specify("3c589");
+		core->network_status.store(-1);
+	}
+	core->osd = std::make_unique<core_headless_osd>(
+			*core->options, network_enabled, audio_enabled);
 	// Serial card: the desktop harness uses an external PTY here and
 	// install_package writes to that card's slave side — but iOS sandboxes
 	// /dev/ptmx (the log's deny(1) file-read-data), so openpty fails, the
@@ -699,6 +801,14 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	// The in-process PCLink channel exists before the machine starts; the card
 	// receives it once the emulation thread has resolved the slot.
 	core->host_serial = std::make_shared<rs232_host_channel>();
+	core->osd->set_audio_writer([ring = &core->audio](const int16_t *samples, size_t frames)
+		{
+			ring->push(samples, frames);
+		});
+	core->osd->network_status_callback = [status = &core->network_status](int value)
+		{
+			status->store(value, std::memory_order_release);
+		};
 
 	core->checkpoint_path = std::string(cfg_dir && *cfg_dir ? cfg_dir : ".") + "/session.sta";
 	datarover_core *handle = core.release();
@@ -873,6 +983,12 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 	return handle;
 }
 
+void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *rom_path)
+{
+	const datarover_create_options defaults{ sizeof(datarover_create_options), 0, 0 };
+	return datarover_create_with_options(nvram_dir, cfg_dir, rom_path, &defaults);
+}
+
 void datarover_set_option(void *machine, int side, int pressed)
 {
 	if (!machine || side < 0 || side > 1) return;
@@ -919,11 +1035,29 @@ void datarover_restart(void *machine)
 {
 	if (!machine) return;
 	auto *core = static_cast<datarover_core *>(machine);
+	core->audio.clear();
 	{
 		std::lock_guard<std::mutex> lock(core->mutex);
 		core->restart_requested.store(true);
 	}
 	core->control_cv.notify_all();
+}
+
+size_t datarover_audio_read(void *machine, int16_t *samples, size_t frame_capacity)
+{
+	if (!machine || !samples || !frame_capacity) return 0;
+	return static_cast<datarover_core *>(machine)->audio.pop(samples, frame_capacity);
+}
+
+void datarover_audio_clear(void *machine)
+{
+	if (!machine) return;
+	static_cast<datarover_core *>(machine)->audio.clear();
+}
+
+int datarover_network_status(void *machine)
+{
+	return machine ? static_cast<datarover_core *>(machine)->network_status.load(std::memory_order_acquire) : -1;
 }
 
 void datarover_destroy(void *machine)

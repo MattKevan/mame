@@ -10,6 +10,13 @@ extern "C" {
 #define DATAROVER_FB_HEIGHT 320
 #define DATAROVER_FB_SIZE (480 * 320 / 4)  // 2bpp, matches FRAME_BYTES
 
+typedef struct datarover_create_options
+{
+	uint32_t struct_size;
+	int32_t network_enabled;
+	int32_t audio_output_enabled;
+} datarover_create_options;
+
 // For a datarover_create handle, returns a snapshot owned by the calling
 // thread, valid until its next framebuffer call. Returns NULL before a
 // frame is available or after emulation stops. The SDL shim may instead
@@ -19,6 +26,8 @@ const uint8_t *datarover_framebuffer_bytes(void *machine);
 size_t datarover_framebuffer_size(void);
 // Lifecycle + input + package + paths land in Task 2; declared here:
 void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *rom_path);
+void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, const char *rom_path,
+		const datarover_create_options *options);
 void datarover_destroy(void *machine);
 
 // Thread-safe controls; changes are applied by the emulation worker.
@@ -46,6 +55,11 @@ int datarover_install_progress(void *machine);
 // behaviour is scheduled in emulated time, so regressions and any guest clock
 // work must use this rather than host wall time.
 double datarover_emulated_seconds(void *machine);
+// Nonblocking pull of mono signed PCM frames at 48 kHz.
+size_t datarover_audio_read(void *machine, int16_t *samples, size_t frame_capacity);
+void datarover_audio_clear(void *machine);
+// 0: disabled, 1: provider initialized, -1: requested provider unavailable.
+int datarover_network_status(void *machine);
 
 #ifdef __cplusplus
 }
