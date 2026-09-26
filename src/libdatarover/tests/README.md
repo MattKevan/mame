@@ -57,3 +57,17 @@ configuration the guest needs before it will open a link at all; without that
 seed the guest never transmits and the test fails after a 180-second timeout.
 The test writes `shot-<frame>.raw` snapshots (480x320 2bpp) into the scratch
 directory for failures, and destroys its own emulator state.
+
+## Checkpoint scheduler boundary
+
+`checkpoint.cpp` verifies that restoring a paused checkpoint does not strand
+CPU execution in overdue screen timers. After the fresh ROM reaches its welcome
+screen, the test saves, destroys and recreates the core, requires a touch-driven
+frame change within two seconds, and requires restart to complete within three
+seconds. Link it like `controls.cpp`, pass the ROM and a fresh scratch directory,
+and use a 90-second process timeout (including shutdown). The companion
+repository's `tools/test_core_checkpoint.sh` supplies the macOS link flags and
+isolated scratch directory.
+
+Expected: `PASS checkpoint restore, guest touch response and prompt restart`.
+The old OSD-callback save/load implementation fails the prompt-restart check.

@@ -313,6 +313,7 @@ public:
 	{
 		m_machine = &machine;
 		machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&core_headless_osd::on_exit, this));
+		machine.add_notifier(MACHINE_NOTIFY_TIMESLICE, machine_notify_delegate(&core_headless_osd::on_timeslice, this));
 		if (m_network_enabled)
 		{
 #if defined(OSD_NET_USE_SLIRP)
@@ -341,7 +342,9 @@ public:
 		render_target *target = machine.render().target_alloc(nullptr, 0);
 		target->set_bounds(480, 320, 1.0F);
 	}
-	void update(bool skip_redraw) override { (void)skip_redraw; if (m_machine && frame_callback) frame_callback(*m_machine); }
+	// update() runs inside the screen timer. Defer lifecycle and framebuffer
+	// work until the scheduler returns so snapshots contain rearmed timers.
+	void update(bool skip_redraw) override { (void)skip_redraw; }
 	void input_update(bool relative_reset) override { (void)relative_reset; }
 	void check_osd_inputs() override { }
 	void set_verbose(bool print_verbose) override { m_verbose = print_verbose; }
@@ -464,6 +467,10 @@ public:
 	}
 
 private:
+	void on_timeslice()
+	{
+		if (m_machine && frame_callback) frame_callback(*m_machine);
+	}
 	void on_exit() { m_modules.exit(); m_network = nullptr; if (exit_callback) exit_callback(); m_machine = nullptr; }
 
 	osd_options &m_options;
@@ -533,6 +540,7 @@ struct datarover_core
 	std::condition_variable control_cv;
 	std::string checkpoint_path;
 	std::string nvram_machine_path;
+	double last_frame_seconds = -1.0;
 	bool restore_attempted = false;
 	bool restored_checkpoint = false;
 	bool restore_touch_pending = false;
@@ -853,6 +861,7 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 				if (index < 0) { finished(); return; }
 				for (;;)
 				{
+					handle->last_frame_seconds = -1.0;
 					handle->restore_attempted = false;
 					handle->restored_checkpoint = false;
 					handle->restore_touch_pending = false;
@@ -878,9 +887,17 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 					// behaviour is defined in emulated time, not host time.
 					handle->emulated_seconds.store(m.time().as_double());
 					if (m.phase() != machine_phase::RUNNING && handle->stop_requested.load()) { m.schedule_exit(); return; }
-					// OSD updates also occur during ROM loading/startup UI. Neither
-					// the address spaces nor input fields are ready at that point.
+					// Device address spaces and input fields require a running machine.
 					if (m.phase() != machine_phase::RUNNING) return;
+					// Poll controls at every safe boundary, but copy the LCD and apply
+					// queued input at the original 60 Hz cadence. This does not depend
+					// on screen timers surviving a legacy checkpoint.
+					double const seconds = m.time().as_double();
+					double const elapsed = seconds - handle->last_frame_seconds;
+					if (elapsed >= 0.0 && elapsed < 1.0 / 60.0
+						&& !handle->paused.load() && !handle->save_requested.load()
+						&& !handle->restart_requested.load() && !handle->stop_requested.load()) return;
+					handle->last_frame_seconds = seconds;
 					if (!handle->restore_attempted) {
 						handle->restore_attempted = true;
 						emu_file file(OPEN_FLAG_READ);

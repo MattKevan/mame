@@ -40,6 +40,7 @@ enum class machine_phase
 enum machine_notification
 {
 	MACHINE_NOTIFY_FRAME,
+	MACHINE_NOTIFY_TIMESLICE, // scheduler has returned; safe for state save/load
 	MACHINE_NOTIFY_RESET,
 	MACHINE_NOTIFY_PAUSE,
 	MACHINE_NOTIFY_RESUME,

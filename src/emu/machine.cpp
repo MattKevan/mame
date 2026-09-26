@@ -422,6 +422,9 @@ int running_machine::run(bool quiet)
 				sound().mapping_update();
 			}
 
+			// Host lifecycle work must run outside device/timer callbacks.
+			call_notifiers(MACHINE_NOTIFY_TIMESLICE);
+
 			// handle save/load
 			if (m_saveload_schedule != saveload_schedule::NONE)
 				handle_saveload();
@@ -1410,6 +1413,9 @@ void running_machine::emscripten_main_loop()
 		while (!machine->m_paused && !machine->scheduled_event_pending() && scheduler->time() < stoptime)
 		{
 			scheduler->timeslice();
+			// Host lifecycle work must run outside device/timer callbacks.
+			machine->call_notifiers(MACHINE_NOTIFY_TIMESLICE);
+
 			// handle save/load
 			if (machine->m_saveload_schedule != saveload_schedule::NONE)
 			{
