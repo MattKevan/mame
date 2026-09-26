@@ -523,6 +523,7 @@ struct datarover_core
 	bool ready = false;
 	bool boot_failed = false;
 	std::atomic<bool> stop_requested{ false };
+	std::atomic<bool> cold_boot_requested{ false };
 	std::atomic<bool> paused{ false }, save_requested{ false }, restart_requested{ false };
 	std::atomic<int> save_status{ 0 };
 	std::atomic<unsigned> option_mask{ 0 };
@@ -531,7 +532,12 @@ struct datarover_core
 	pcm_ring audio;
 	std::condition_variable control_cv;
 	std::string checkpoint_path;
+	std::string nvram_machine_path;
 	bool restore_attempted = false;
+	bool restored_checkpoint = false;
+	bool restore_touch_pending = false;
+	std::array<uint8_t, DATAROVER_FB_SIZE> restore_touch_frame{};
+	std::chrono::steady_clock::time_point restore_touch_deadline{};
 	unsigned applied_option = 0;
 	ioport_field *option_button = nullptr;
 	std::chrono::steady_clock::time_point last_checkpoint = std::chrono::steady_clock::now();
@@ -541,6 +547,12 @@ struct datarover_core
 	struct pen_event { int x, y; bool down; };
 	std::deque<pen_event> pen_events;
 	int last_pen_x = 0, last_pen_y = 0;
+	// The guest samples touchscreen state from its event loop, so a host click
+	// must remain down long enough to be observed even when its up event arrives
+	// before the next guest poll.
+	bool pen_is_down = false;
+	bool pen_up_pending = false;
+	std::chrono::steady_clock::time_point pen_down_since{};
 	std::string slave_path;
 	// In-process PCLink transport. Preferred over the PTY slave path wherever
 	// openpty is unavailable (iOS) and used by the native shells on both
@@ -811,6 +823,7 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 		};
 
 	core->checkpoint_path = std::string(cfg_dir && *cfg_dir ? cfg_dir : ".") + "/session.sta";
+	core->nvram_machine_path = std::string(nvram_dir && *nvram_dir ? nvram_dir : ".") + "/datarover840";
 	datarover_core *handle = core.release();
 	datarover_core *expected = nullptr;
 	if (!s_live.compare_exchange_strong(expected, handle, std::memory_order_acq_rel))
@@ -838,7 +851,19 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 				manager->start_http_server();
 				int index = driver_list::find("datarover840");
 				if (index < 0) { finished(); return; }
-				machine_config config(driver_list::driver(index), *handle->options);
+				for (;;)
+				{
+					handle->restore_attempted = false;
+					handle->restored_checkpoint = false;
+					handle->restore_touch_pending = false;
+					handle->memintf = nullptr;
+					handle->pen_x = handle->pen_y = handle->pen_button = nullptr;
+					handle->option_button = nullptr;
+					handle->rs2321_slot = nullptr;
+					handle->rs2321_card = nullptr;
+					handle->pen_is_down = false;
+					handle->pen_up_pending = false;
+					machine_config config(driver_list::driver(index), *handle->options);
 				running_machine machine(config, *manager);
 				// Match mame_machine_manager::execute: Lua reads the manager's
 				// machine during start(). Unregister before destruction on all exits.
@@ -867,6 +892,8 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 								&& m.save().read_file(file) != STATERR_NONE) {
 								backup.seekg(0);
 								m.save().read_stream(backup);
+							} else {
+								handle->restored_checkpoint = true;
 							}
 						}
 					}
@@ -874,6 +901,8 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 						// Never checkpoint a finger or Option control held down.
 						if (handle->option_button) handle->option_button->clear_value();
 						if (handle->pen_button) handle->pen_button->clear_value();
+						handle->pen_is_down = false;
+						handle->pen_up_pending = false;
 						handle->applied_option = 0;
 						std::lock_guard<std::mutex> lock(handle->mutex);
 						handle->pen_events.clear();
@@ -894,7 +923,11 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 						}
 					}
 					if (handle->stop_requested.load()) { m.schedule_exit(); return; }
-					if (handle->restart_requested.exchange(false)) m.schedule_soft_reset();
+					// A native-shell restart must not call machine::soft_reset here:
+					// the DataRover DAC stream can fault while its output buffer is
+					// flushed from machine_reset. Exit this machine and construct a
+					// fresh one on the same worker instead.
+					if (handle->restart_requested.load(std::memory_order_acquire)) { m.schedule_exit(); return; }
 					if (handle->paused.load() && !handle->save_requested.load()) {
 						std::unique_lock<std::mutex> lock(handle->mutex);
 						handle->control_cv.wait(lock, [handle] {
@@ -941,7 +974,43 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 					if (have_event) {
 						if (handle->pen_x) handle->pen_x->set_value(uint32_t(event.x) * 0xffffU / 479U);
 						if (handle->pen_y) handle->pen_y->set_value(uint32_t(event.y) * 0xffffU / 319U);
-						if (handle->pen_button) { if (event.down) handle->pen_button->set_value(1); else handle->pen_button->clear_value(); }
+						if (event.down) {
+							if (handle->restored_checkpoint && !handle->restore_touch_pending) {
+								std::lock_guard<std::mutex> lock(handle->mutex);
+								handle->restore_touch_frame = handle->frame;
+								handle->restore_touch_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+								handle->restore_touch_pending = true;
+							}
+							if (!handle->pen_is_down)
+								handle->pen_down_since = std::chrono::steady_clock::now();
+							handle->pen_is_down = true;
+							handle->pen_up_pending = false;
+							if (handle->pen_button) handle->pen_button->set_value(1);
+						} else if (handle->pen_is_down) {
+							// The guest reliably samples a pen press held for at least
+							// half a second. Queue up, then release after that dwell even
+							// if the host generated a quick click.
+							handle->pen_up_pending = true;
+						}
+					}
+					if (handle->pen_up_pending
+							&& std::chrono::steady_clock::now() - handle->pen_down_since >= std::chrono::milliseconds(500)) {
+						if (handle->pen_button) handle->pen_button->clear_value();
+						handle->pen_is_down = false;
+						handle->pen_up_pending = false;
+					}
+					if (handle->restore_touch_pending && std::chrono::steady_clock::now() >= handle->restore_touch_deadline) {
+						bool unchanged;
+						{
+							std::lock_guard<std::mutex> lock(handle->mutex);
+							unchanged = std::memcmp(handle->frame.data(), handle->restore_touch_frame.data(), handle->frame.size()) == 0;
+						}
+						handle->restore_touch_pending = false;
+						if (unchanged) {
+							handle->cold_boot_requested.store(true, std::memory_order_release);
+							m.schedule_exit();
+							return;
+						}
 					}
 					auto &space = handle->memintf->space(AS_PROGRAM);
 					uint32_t base = space.read_dword(DINO_MMIO_BASE + DINO_VIDEO_HIGH_BUFFER_OFF) & 0xfffffff0U;
@@ -959,7 +1028,40 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 					handle->ready = true;
 					handle->ready_cv.notify_all();
 				};
-				handle->run_result = machine.run(true);
+					handle->run_result = machine.run(true);
+					bool const explicit_restart = handle->restart_requested.exchange(false, std::memory_order_acq_rel);
+					if (explicit_restart)
+						handle->cold_boot_requested.store(true, std::memory_order_release);
+					if (handle->cold_boot_requested.exchange(false, std::memory_order_acq_rel))
+					{
+						const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+								std::chrono::system_clock::now().time_since_epoch()).count();
+						const char *backup_kind = explicit_restart ? ".restart-" : ".stuck-";
+						const std::string backup_path = handle->checkpoint_path + backup_kind + std::to_string(stamp);
+						const std::string nvram_backup_path = handle->nvram_machine_path + backup_kind + std::to_string(stamp);
+						bool const checkpoint_backed_up = (::rename(handle->checkpoint_path.c_str(), backup_path.c_str()) == 0);
+						bool const checkpoint_missing = !checkpoint_backed_up && errno == ENOENT;
+						bool const nvram_backed_up = (::rename(handle->nvram_machine_path.c_str(), nvram_backup_path.c_str()) == 0);
+						bool const nvram_missing = !nvram_backed_up && errno == ENOENT;
+						if ((checkpoint_backed_up || checkpoint_missing) && (nvram_backed_up || nvram_missing))
+						{
+							std::lock_guard<std::mutex> lock(handle->mutex);
+							handle->frame_valid = false;
+							handle->active = false;
+							handle->frame_revision.store(0, std::memory_order_release);
+							handle->save_requested.store(false, std::memory_order_release);
+							handle->save_status.store(0, std::memory_order_release);
+							handle->option_mask.store(0, std::memory_order_release);
+							handle->pen_events.clear();
+							continue;
+						}
+						if (checkpoint_backed_up)
+							::rename(backup_path.c_str(), handle->checkpoint_path.c_str());
+						if (nvram_backed_up)
+							::rename(nvram_backup_path.c_str(), handle->nvram_machine_path.c_str());
+					}
+					break;
+				}
 				finished();
 			}
 			catch (...) { finished(); }

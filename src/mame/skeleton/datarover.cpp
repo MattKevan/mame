@@ -30,6 +30,7 @@
 ***************************************************************************/
 
 #include "emu.h"
+#include "ui/ui.h"
 
 #include "bus/pccard/3c589.h"
 #include "bus/pccard/pccard.h"
