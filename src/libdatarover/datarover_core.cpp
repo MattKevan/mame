@@ -319,7 +319,7 @@ public:
 			try
 			{
 				m_modules.register_module(NETDEV_SLIRP);
-				m_network = &m_modules.select_module<osd::netdev_module>(
+				m_network = &m_modules.select_module<netdev_module>(
 						*this, m_options, OSD_NETDEV_PROVIDER, "slirp");
 			}
 			catch (...)
@@ -470,7 +470,7 @@ private:
 	bool m_network_enabled;
 	bool m_audio_enabled;
 	osd_module_manager m_modules;
-	osd::netdev_module *m_network = nullptr;
+	netdev_module *m_network = nullptr;
 	std::function<void(const int16_t *, size_t)> m_audio_write;
 	running_machine *m_machine = nullptr;
 	bool m_verbose = false;
