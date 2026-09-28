@@ -2077,9 +2077,12 @@ u16 datarover_state::main_battery_reading() const
 	// Host percentage is transient input, not saved guest state. Zero disables
 	// mirroring; 1..101 encode 0..100% against the ROM's calibration record.
 	// Bit 7 independently mirrors the host AC adapter.
+	// The level never drops below 330 counts (about 35%): under the ROM's
+	// 320-count warning point Magic Cap turns off communications, which
+	// would cut the guest's network and PCLink whenever the host runs low.
 	unsigned const host = m_host_battery->read() & 0x7f;
 	if (host)
-		return 80 + (std::min(host - 1, 100U) * 720 + 50) / 100;
+		return std::max<u16>(330, 80 + (std::min(host - 1, 100U) * 720 + 50) / 100);
 
 	// Full charge reads at the calibration record's full point, so the OS
 	// reports 100%.  "Low" sits under the 320-count warning threshold but

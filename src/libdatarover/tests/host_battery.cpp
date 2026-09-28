@@ -63,7 +63,10 @@ void expect(void *core, int percentage, int ac) {
  unsigned sample = percentage < 0 ? 0 : unsigned(std::min(percentage,100)+1) | (ac ? 128 : 0);
  await([&]{ auto s=snapshot(); return s.revision>before && s.sample==sample; }, "worker applied queued sample");
  auto s=snapshot();
- require(s.main == (percentage<0 ? 200 : 80 + (std::min(percentage,100)*720+50)/100), "main ADC mapping");
+ // Mirroring never drops the guest below its 320-count low-power point:
+ // below that Magic Cap turns off communications, which breaks networking
+ // and PCLink. The floor is 330 counts (about 35%).
+ require(s.main == (percentage<0 ? 200 : std::max(330, 80 + (std::min(percentage,100)*720+50)/100)), "main ADC mapping");
  require(s.backup == (percentage<0 ? 300 : 1000), "backup health/restoration");
  require(s.ac == unsigned(percentage>=0 && ac!=0), "AC state/restoration");
 }
