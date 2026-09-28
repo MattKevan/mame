@@ -16,12 +16,14 @@
 #if defined(OSD_NET_USE_SLIRP)
 
 #include "netdev_common.h"
+#include "slirp_redirect.h"
 
 #include "osdcore.h"
 
 #include <slirp/libslirp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -34,6 +36,13 @@
 
 
 namespace osd {
+
+namespace {
+std::atomic<uint16_t> s_http_redirect_port{ 0 };
+} // anonymous namespace
+
+void set_slirp_http_redirect_port(uint16_t port) { s_http_redirect_port.store(port); }
+uint16_t slirp_http_redirect_port() { return s_http_redirect_port.load(); }
 
 namespace {
 
@@ -139,6 +148,10 @@ netdev_slirp::netdev_slirp(network_handler &handler)
 			&netdev_slirp::unregister_poll_socket;
 
 	m_slirp = slirp_new(&config, &m_callbacks, this);
+#if defined(SLIRP_HAS_HTTP_REDIRECT)
+	if (m_slirp)
+		slirp_set_http_redirect_port(m_slirp, slirp_http_redirect_port());
+#endif
 	if (!m_slirp)
 		osd_printf_error("libslirp network could not be initialized\n");
 }

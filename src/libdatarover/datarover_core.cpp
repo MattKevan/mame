@@ -75,6 +75,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
@@ -89,6 +90,7 @@ GAME_EXTERN(datarover840);
 
 #if defined(OSD_NET_USE_SLIRP)
 extern const module_type NETDEV_SLIRP;
+#include "osd/modules/netdev/slirp_redirect.h"
 #endif
 
 namespace {
@@ -306,8 +308,9 @@ std::vector<uint8_t> pclink_package_metadata(uint32_t size, const std::vector<ui
 class core_headless_osd : public osd_interface
 {
 public:
-	core_headless_osd(osd_options &options, bool network_enabled, bool audio_enabled)
-		: m_options(options), m_network_enabled(network_enabled), m_audio_enabled(audio_enabled) { }
+	core_headless_osd(osd_options &options, bool network_enabled, bool audio_enabled, uint16_t http_redirect_port)
+		: m_options(options), m_network_enabled(network_enabled), m_audio_enabled(audio_enabled)
+		, m_http_redirect_port(http_redirect_port) { }
 	~core_headless_osd() override { m_modules.exit(); }
 	std::function<void(running_machine &)> frame_callback;
 	std::function<void()> exit_callback;
@@ -323,6 +326,7 @@ public:
 #if defined(OSD_NET_USE_SLIRP)
 			try
 			{
+				osd::set_slirp_http_redirect_port(m_http_redirect_port);
 				m_modules.register_module(NETDEV_SLIRP);
 				m_network = &m_modules.select_module<netdev_module>(
 						*this, m_options, OSD_NETDEV_PROVIDER, "slirp");
@@ -480,6 +484,7 @@ private:
 	osd_options &m_options;
 	bool m_network_enabled;
 	bool m_audio_enabled;
+	uint16_t m_http_redirect_port;
 	osd_module_manager m_modules;
 	netdev_module *m_network = nullptr;
 	std::function<void(const int16_t *, size_t)> m_audio_write;
@@ -822,12 +827,17 @@ const uint8_t *datarover_framebuffer_bytes(void *machine)
 void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, const char *rom_path,
 		const datarover_create_options *create_options)
 {
-	const bool network_enabled = create_options
-			&& create_options->struct_size >= sizeof(datarover_create_options)
+	auto const provides = [create_options](std::size_t field_end) {
+		return create_options && create_options->struct_size >= field_end;
+	};
+	const bool network_enabled = provides(offsetof(datarover_create_options, network_enabled) + sizeof(int32_t))
 			&& create_options->network_enabled;
-	const bool audio_enabled = create_options
-			&& create_options->struct_size >= sizeof(datarover_create_options)
+	const bool audio_enabled = provides(offsetof(datarover_create_options, audio_output_enabled) + sizeof(int32_t))
 			&& create_options->audio_output_enabled;
+	const int32_t requested_redirect = provides(offsetof(datarover_create_options, http_redirect_port) + sizeof(int32_t))
+			? create_options->http_redirect_port : 0;
+	const uint16_t http_redirect_port = network_enabled && requested_redirect > 0 && requested_redirect <= 65535
+			? uint16_t(requested_redirect) : 0;
 	auto core = std::make_unique<datarover_core>();
 	core->options = std::make_unique<osd_options>();
 
@@ -890,7 +900,7 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 		core->network_status.store(-1);
 	}
 	core->osd = std::make_unique<core_headless_osd>(
-			*core->options, network_enabled, audio_enabled);
+			*core->options, network_enabled, audio_enabled, http_redirect_port);
 	// Serial card: the desktop harness uses an external PTY here and
 	// install_package writes to that card's slave side — but iOS sandboxes
 	// /dev/ptmx (the log's deny(1) file-read-data), so openpty fails, the
@@ -1248,7 +1258,7 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 
 void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *rom_path)
 {
-	const datarover_create_options defaults{ sizeof(datarover_create_options), 0, 0 };
+	const datarover_create_options defaults{ sizeof(datarover_create_options), 0, 0, 0 };
 	return datarover_create_with_options(nvram_dir, cfg_dir, rom_path, &defaults);
 }
 

@@ -15,6 +15,10 @@ typedef struct datarover_create_options
 	uint32_t struct_size;
 	int32_t network_enabled;
 	int32_t audio_output_enabled;
+	// Host loopback port for guest TCP port 80 (the web upgrade proxy);
+	// 0 disables. Needs network_enabled. Appended: older callers pass a
+	// smaller struct_size and get 0.
+	int32_t http_redirect_port;
 } datarover_create_options;
 
 // For a datarover_create handle, returns a snapshot owned by the calling
