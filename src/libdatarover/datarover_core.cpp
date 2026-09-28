@@ -41,6 +41,7 @@
 // snapshots remain valid until the next framebuffer call on that caller thread.
 
 #include "libdatarover/datarover_core.h"
+#include "libdatarover/host_clock.h"
 
 #include "emu.h"
 
@@ -60,6 +61,7 @@
 #include "frontend/mame/ui/menuitem.h"
 #include "render.h"
 #include "fileio.h"
+#include "devices/cpu/mips/mips1.h"
 #include "devices/bus/rs232/host_serial.h"
 #include "devices/bus/rs232/null_modem.h"
 
@@ -93,6 +95,8 @@ namespace {
 
 constexpr uint32_t DINO_MMIO_BASE = 0x10c00000U;
 constexpr uint32_t DINO_VIDEO_HIGH_BUFFER_OFF = 0x030U;
+constexpr uint32_t DINO_POWER_CONTROL_OFF = 0x1c4U;
+constexpr uint32_t DINO_POWER_VCC_ON = 0x0000'0001U;
 constexpr uint32_t FALLBACK_BASE = 0x003f6a00U;
 constexpr uint32_t DRAM_LIMIT = 0x00400000U;
 
@@ -534,6 +538,22 @@ struct datarover_core
 	std::atomic<bool> paused{ false }, save_requested{ false }, restart_requested{ false };
 	std::atomic<int> save_status{ 0 };
 	std::atomic<unsigned> option_mask{ 0 };
+	// One atomic carries a coherent battery/AC sample: low 7 bits percent+1,
+	// bit 7 AC attached, zero disabled. Only the worker touches input fields.
+	std::atomic<unsigned> host_battery{ 0 };
+	// Request fields are protected by mutex; the worker owns the applied revision.
+	bool host_clock_enabled = false;
+	int64_t host_clock_milliseconds = 0;
+	std::chrono::steady_clock::time_point host_clock_sample{};
+	uint64_t host_clock_generation = 0;
+	uint64_t applied_clock_generation = 0;
+	uint64_t flight_clock_generation = 0;
+	int64_t flight_clock_milliseconds = 0;
+	std::chrono::steady_clock::time_point flight_clock_sample{};
+	std::chrono::steady_clock::time_point flight_clock_started{};
+	datarover_host_clock::bridge clock_bridge;
+	std::array<uint32_t, 1024> clock_bridge_ram{};
+	std::atomic<int> host_clock_status{ 0 };
 	std::atomic<uint64_t> frame_revision{ 0 };
 	std::atomic<int> network_status{ 0 };
 	pcm_ring audio;
@@ -548,6 +568,13 @@ struct datarover_core
 	std::chrono::steady_clock::time_point restore_touch_deadline{};
 	unsigned applied_option = 0;
 	ioport_field *option_button = nullptr;
+	ioport_field *host_battery_input = nullptr;
+	// A powered-down guest ignores the pen until its power button is pressed,
+	// as on the hardware. The first touch presses it for the user instead.
+	ioport_field *power_button = nullptr;
+	std::chrono::steady_clock::time_point power_release_at{};
+	bool power_pressed = false;
+	bool wake_stroke = false;
 	std::chrono::steady_clock::time_point last_checkpoint = std::chrono::steady_clock::now();
 	bool active = false;
 	bool frame_valid = false;
@@ -581,6 +608,60 @@ struct datarover_core
 	device_slot_interface *rs2321_slot = nullptr;
 	device_t *rs2321_card = nullptr;
 };
+
+// Queue only on a running guest. Drain existing callbacks before lifecycle
+// operations, so saved guest queues never refer to private host callback state.
+static void service_host_clock(datarover_core &core, running_machine &machine)
+{
+	std::lock_guard<std::mutex> lock(core.mutex);
+	bool const was_in_flight = core.clock_bridge.in_flight();
+	if (!was_in_flight && core.host_clock_generation == core.applied_clock_generation) return;
+	if (!was_in_flight && !core.host_clock_enabled) {
+		core.host_clock_status.store(0);
+		core.applied_clock_generation = core.host_clock_generation;
+		return;
+	}
+	if (!was_in_flight && (core.paused.load() || core.stop_requested.load() || core.restart_requested.load())) return;
+
+	auto &program = core.memintf->space(AS_PROGRAM);
+	auto read = [&](uint32_t address) { return program.read_dword(address); };
+	auto write = [&](uint32_t address, uint32_t value) { program.write_dword(address, value); };
+	// A guest that stops draining its run queue (it powered itself off, say)
+	// must not hold pause, save, restart or shutdown. Retry once it is idle.
+	if (was_in_flight && std::chrono::steady_clock::now() - core.flight_clock_started > std::chrono::seconds(5)
+			&& core.clock_bridge.abandon(read, write))
+		return;
+	if (was_in_flight && core.flight_clock_generation != core.host_clock_generation)
+		core.clock_bridge.cancel(write);
+	uint64_t const generation = was_in_flight ? core.flight_clock_generation : core.host_clock_generation;
+	int64_t const sample = was_in_flight ? core.flight_clock_milliseconds : core.host_clock_milliseconds;
+	auto const sampled_at = was_in_flight ? core.flight_clock_sample : core.host_clock_sample;
+	auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - sampled_at).count();
+	int status = -1;
+	// Validate before adding elapsed time; the ABI accepts all int64 values.
+	if (sample >= -2208988800000LL && sample <= 253402300799999LL
+		&& elapsed >= 0 && elapsed <= 253402300799999LL - sample) {
+		if (auto *cpu = dynamic_cast<r3900_device *>(machine.root_device().subdevice("maincpu"))) {
+			auto result = core.clock_bridge.synchronize(uint32_t(cpu->pc()), sample + elapsed,
+				read, write, [&](uint32_t address, uint32_t size) { cpu->invalidate_data_cache(address, size); });
+			status = result == datarover_host_clock::result::synced ? 2
+				: result == datarover_host_clock::result::pending ? 1 : -1;
+		}
+	}
+	if (!was_in_flight && core.clock_bridge.in_flight()) {
+		core.flight_clock_generation = generation;
+		core.flight_clock_milliseconds = sample;
+		core.flight_clock_sample = sampled_at;
+		core.flight_clock_started = std::chrono::steady_clock::now();
+	}
+	// Unready or unsupported guests must not display a promise indefinitely.
+	if (status == 1 && !core.clock_bridge.in_flight() && elapsed > 60000) status = -1;
+	if (generation == core.host_clock_generation) {
+		core.host_clock_status.store(status);
+		if (status != 1 && !core.clock_bridge.in_flight()) core.applied_clock_generation = generation;
+	}
+}
 
 // One live handle per process: mame_machine_manager::instance() binds a single
 // options set process-wide, so a second concurrent create must fail.
@@ -868,6 +949,13 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 					handle->memintf = nullptr;
 					handle->pen_x = handle->pen_y = handle->pen_button = nullptr;
 					handle->option_button = nullptr;
+					handle->host_battery_input = nullptr;
+					handle->power_button = nullptr;
+					handle->power_pressed = false;
+					handle->wake_stroke = false;
+					handle->applied_clock_generation = 0;
+					handle->clock_bridge = {};
+					handle->clock_bridge_ram.fill(0);
 					handle->rs2321_slot = nullptr;
 					handle->rs2321_card = nullptr;
 					handle->pen_is_down = false;
@@ -914,49 +1002,22 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 							}
 						}
 					}
-					if (handle->paused.load() || handle->stop_requested.load()) {
-						// Never checkpoint a finger or Option control held down.
-						if (handle->option_button) handle->option_button->clear_value();
-						if (handle->pen_button) handle->pen_button->clear_value();
-						handle->pen_is_down = false;
-						handle->pen_up_pending = false;
-						handle->applied_option = 0;
-						std::lock_guard<std::mutex> lock(handle->mutex);
-						handle->pen_events.clear();
-					}
-					const auto now = std::chrono::steady_clock::now();
-					if (handle->save_requested.load() || handle->stop_requested.load()
-						|| now - handle->last_checkpoint > std::chrono::seconds(60)) {
-						if (m.scheduler().can_save()) {
-							handle->save_requested.store(false);
-							const auto temporary = handle->checkpoint_path + ".tmp";
-							emu_file file(OPEN_FLAG_WRITE | OPEN_FLAG_CREATE | OPEN_FLAG_CREATE_PATHS);
-							bool ok = !file.open(temporary);
-							if (ok) ok = m.save().write_file(file) == STATERR_NONE;
-							file.close();
-							if (ok) ok = ::rename(temporary.c_str(), handle->checkpoint_path.c_str()) == 0;
-							handle->last_checkpoint = now;
-							handle->save_status.store(ok ? 2 : -1);
-						}
-					}
-					if (handle->stop_requested.load()) { m.schedule_exit(); return; }
-					// A native-shell restart must not call machine::soft_reset here:
-					// the DataRover DAC stream can fault while its output buffer is
-					// flushed from machine_reset. Exit this machine and construct a
-					// fresh one on the same worker instead.
-					if (handle->restart_requested.load(std::memory_order_acquire)) { m.schedule_exit(); return; }
-					if (handle->paused.load() && !handle->save_requested.load()) {
-						std::unique_lock<std::mutex> lock(handle->mutex);
-						handle->control_cv.wait(lock, [handle] {
-							return !handle->paused.load() || handle->stop_requested.load()
-								|| handle->save_requested.load() || handle->restart_requested.load();
-						});
-						return;
-					}
 					if (!handle->memintf) {
 						if (auto *cpu = m.root_device().subdevice("maincpu")) cpu->interface(handle->memintf);
 						if (!handle->memintf || !handle->memintf->has_space(AS_PROGRAM)) return;
+						auto &program = handle->memintf->space(AS_PROGRAM);
+						// Host callback storage is outside the guest heap and immutable
+						// between calls. Saves wait for an in-flight callback; one that
+						// was abandoned can remain queued in a checkpoint, and this runs
+						// after restore and before the guest does, so it finds the
+						// disabled callback in place.
+						program.install_ram(0x01000000, 0x01000fff, handle->clock_bridge_ram.data());
+						handle->clock_bridge.initialize([&](uint32_t address, uint32_t value) {
+							program.write_dword(address, value);
+						});
+						if (auto *port = m.root_device().ioport("HOST_BATTERY")) handle->host_battery_input = port->field(0xff);
 						if (auto *port = m.root_device().ioport("OPTION_BUTTON")) handle->option_button = port->field(1);
+						if (auto *port = m.root_device().ioport("POWER_BUTTON")) handle->power_button = port->field(1);
 						if (auto *port = m.root_device().ioport("TOUCH_X")) handle->pen_x = port->field(0xffff);
 						if (auto *port = m.root_device().ioport("TOUCH_Y")) handle->pen_y = port->field(0xffff);
 						if (auto *port = m.root_device().ioport("TOUCH_BUTTON")) handle->pen_button = port->field(1);
@@ -970,6 +1031,62 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 								nm->set_host_channel(handle->host_serial);
 						}
 					}
+					service_host_clock(*handle, m);
+					if (handle->paused.load() || handle->stop_requested.load()) {
+						// Never checkpoint a finger or Option control held down.
+						if (handle->option_button) handle->option_button->clear_value();
+						if (handle->pen_button) handle->pen_button->clear_value();
+						if (handle->power_button) handle->power_button->clear_value();
+						handle->power_pressed = false;
+						handle->wake_stroke = false;
+						handle->pen_is_down = false;
+						handle->pen_up_pending = false;
+						handle->applied_option = 0;
+						std::lock_guard<std::mutex> lock(handle->mutex);
+						handle->pen_events.clear();
+					}
+					const auto now = std::chrono::steady_clock::now();
+					if (handle->save_requested.load() || handle->stop_requested.load()
+						|| now - handle->last_checkpoint > std::chrono::seconds(60)) {
+						if (!handle->clock_bridge.in_flight() && m.scheduler().can_save()) {
+							handle->save_requested.store(false);
+							const auto temporary = handle->checkpoint_path + ".tmp";
+							emu_file file(OPEN_FLAG_WRITE | OPEN_FLAG_CREATE | OPEN_FLAG_CREATE_PATHS);
+							bool ok = !file.open(temporary);
+							if (ok) ok = m.save().write_file(file) == STATERR_NONE;
+							file.close();
+							if (ok) ok = ::rename(temporary.c_str(), handle->checkpoint_path.c_str()) == 0;
+							handle->last_checkpoint = now;
+							handle->save_status.store(ok ? 2 : -1);
+						}
+					}
+					if (handle->stop_requested.load() && !handle->clock_bridge.in_flight()) { m.schedule_exit(); return; }
+					// A native-shell restart must not call machine::soft_reset here:
+					// the DataRover DAC stream can fault while its output buffer is
+					// flushed from machine_reset. Exit this machine and construct a
+					// fresh one on the same worker instead.
+					if (handle->restart_requested.load(std::memory_order_acquire) && !handle->clock_bridge.in_flight()) { m.schedule_exit(); return; }
+					if (handle->paused.load() && !handle->save_requested.load() && !handle->clock_bridge.in_flight()) {
+						std::unique_lock<std::mutex> lock(handle->mutex);
+						handle->control_cv.wait(lock, [handle] {
+							return !handle->paused.load() || handle->stop_requested.load()
+								|| handle->save_requested.load() || handle->restart_requested.load();
+						});
+						return;
+					}
+					// Reapply after restores too; these are current host inputs, not
+					// checkpoint state. Clear the override to resume normal settings.
+					unsigned const battery = handle->host_battery.load(std::memory_order_acquire);
+					if (handle->host_battery_input) {
+						if (battery) {
+							handle->host_battery_input->set_value(battery);
+						} else {
+							handle->host_battery_input->clear_value();
+						}
+					}
+#ifdef DATAROVER_CORE_TEST_OBSERVER
+					DATAROVER_CORE_TEST_OBSERVER(*handle, m);
+#endif
 					const unsigned option = handle->option_mask.load();
 					if (option != handle->applied_option && handle->option_button) {
 						if (option) handle->option_button->set_value(1);
@@ -987,6 +1104,30 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 							handle->pen_events.pop_front();
 							have_event = true;
 						}
+					}
+					// Swallow the rest of a waking stroke so it does not also tap the
+					// screen the guest draws once it is back on.
+					if (have_event && handle->wake_stroke) {
+						if (!event.down) handle->wake_stroke = false;
+						have_event = false;
+					}
+					if (have_event && event.down && handle->power_button) {
+						auto *cpu = m.root_device().subdevice("maincpu");
+						bool const halted = cpu && cpu->execute().suspended(SUSPEND_REASON_HALT);
+						auto &space = handle->memintf->space(AS_PROGRAM);
+						if (halted && !(space.read_dword(DINO_MMIO_BASE + DINO_POWER_CONTROL_OFF) & DINO_POWER_VCC_ON)) {
+							handle->power_button->set_value(1);
+							handle->power_pressed = true;
+							handle->power_release_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+							handle->wake_stroke = true;
+							// Waking proves the restored guest is not hung.
+							handle->restored_checkpoint = false;
+							have_event = false;
+						}
+					}
+					if (handle->power_pressed && std::chrono::steady_clock::now() >= handle->power_release_at) {
+						handle->power_button->clear_value();
+						handle->power_pressed = false;
 					}
 					if (have_event) {
 						if (handle->pen_x) handle->pen_x->set_value(uint32_t(event.x) * 0xffffU / 479U);
@@ -1023,6 +1164,9 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 							unchanged = std::memcmp(handle->frame.data(), handle->restore_touch_frame.data(), handle->frame.size()) == 0;
 						}
 						handle->restore_touch_pending = false;
+						// Check only the first touch after a restore. Later touches on
+						// inert screen areas are ordinary input, not a hang.
+						handle->restored_checkpoint = false;
 						if (unchanged) {
 							handle->cold_boot_requested.store(true, std::memory_order_release);
 							m.schedule_exit();
@@ -1106,6 +1250,31 @@ void *datarover_create(const char *nvram_dir, const char *cfg_dir, const char *r
 {
 	const datarover_create_options defaults{ sizeof(datarover_create_options), 0, 0 };
 	return datarover_create_with_options(nvram_dir, cfg_dir, rom_path, &defaults);
+}
+
+void datarover_set_host_clock(void *machine, int enabled, int64_t local_unix_milliseconds)
+{
+	if (!machine) return;
+	auto *core = static_cast<datarover_core *>(machine);
+	std::lock_guard<std::mutex> lock(core->mutex);
+	core->host_clock_enabled = enabled != 0;
+	core->host_clock_milliseconds = local_unix_milliseconds;
+	core->host_clock_sample = std::chrono::steady_clock::now();
+	++core->host_clock_generation;
+	core->host_clock_status.store(enabled ? 1 : 0);
+}
+
+int datarover_host_clock_status(void *machine)
+{
+	return machine ? static_cast<datarover_core *>(machine)->host_clock_status.load() : -1;
+}
+
+void datarover_set_host_battery(void *machine, int percentage, int external_power)
+{
+	if (!machine) return;
+	unsigned const sample = percentage < 0 ? 0
+			: unsigned(std::min(percentage, 100) + 1) | (external_power ? 0x80U : 0);
+	static_cast<datarover_core *>(machine)->host_battery.store(sample, std::memory_order_release);
 }
 
 void datarover_set_option(void *machine, int side, int pressed)

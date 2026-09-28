@@ -17,8 +17,9 @@ int main(int argc,char**argv) {
  auto create=[&]{return datarover_create((base/"nvram").c_str(),(base/"cfg").c_str(),argv[1]);};
  auto fail=[](const char*why){fprintf(stderr,"FAIL %s\n",why); std::fflush(nullptr); std::_Exit(1);};
  auto*c=create(); if(!c) fail("initial boot");
- // Allow the fresh ROM to reach its stable, touch-gated welcome screen.
- std::this_thread::sleep_for(25s);
+ // Allow the fresh ROM to reach its stable, touch-gated welcome screen. Wait
+ // in emulated time: a freshly booted simulator can run several times slower.
+ if(!wait_for([&]{return datarover_emulated_seconds(c)>=25.0;},std::chrono::seconds(75))) fail("guest did not reach the welcome screen");
  datarover_set_paused(c,1);
  if(!wait_for([&]{return datarover_save_status(c)==2;},3s)) fail("checkpoint save");
  datarover_destroy(c);

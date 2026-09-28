@@ -30,7 +30,17 @@ void *datarover_create_with_options(const char *nvram_dir, const char *cfg_dir, 
 		const datarover_create_options *options);
 void datarover_destroy(void *machine);
 
+// Host local calendar time: Unix milliseconds plus the current UTC offset.
+// The worker waits for a safe guest boundary; elapsed queue time is included.
+void datarover_set_host_clock(void *machine, int enabled, int64_t local_unix_milliseconds);
+// 0 disabled, 1 waiting for guest, 2 synchronized, -1 unsupported guest state/ROM.
+int datarover_host_clock_status(void *machine);
+
 // Thread-safe controls; changes are applied by the emulation worker.
+// percentage 0..100 mirrors the host; negative disables/unavailable, >100 clamps.
+// external_power is a boolean AC-adapter input. Host choice survives restart
+// and checkpoint restore, and is never part of guest saved state.
+void datarover_set_host_battery(void *machine, int percentage, int external_power);
 void datarover_set_option(void *machine, int side, int pressed);
 void datarover_set_paused(void *machine, int paused);
 void datarover_request_save(void *machine);

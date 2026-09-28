@@ -71,3 +71,36 @@ isolated scratch directory.
 
 Expected: `PASS checkpoint restore, guest touch response and prompt restart`.
 The old OSD-callback save/load implementation fails the prompt-restart check.
+
+## Host battery inputs
+
+`host_battery.cpp` exercises the actual native worker and Betty ADC path in the
+IDT monitor. It includes the core translation unit with a test-only observer;
+measurements are taken on the worker and copied under a mutex. The ordinary
+library build has no observer or diagnostic ABI. The test covers every integer
+percentage, clamping/unavailability, AC state, backup-cell health, isolation
+from synthetic charging, an update queued while paused, a completed restart,
+and checkpoint recreation without persisting host inputs.
+
+Run companion `tools/test_core_host_battery.sh` with `CORE_LIBRARY` pointing to
+the built macOS library, `CORE_BUILD_ARGUMENTS` to that target's C++
+`common-args.resp` (the response file containing `-std=c++20` without Objective-C
+ARC flags), and `ROM_PATH` to the release ROM. This keeps the fixture's MAME
+headers and compile definitions identical to the app. The script creates
+isolated state and enforces a 90-second timeout.
+
+## Power-off wake
+
+`power_wake.cpp` powers the guest off through its own power-button path, then
+requires a tap to wake it, both live and after restoring a powered-down
+checkpoint. It also requires that neither the wake nor later taps on inert
+areas trigger stuck-restore recovery. Build it like `host_battery.cpp`; the
+companion `tools/test_core_power_wake.sh` does this with a 120-second timeout.
+
+## Host clock bridge
+
+`host_clock.cpp` checks the calendar bridge protocol against fake guest memory,
+with no MAME machine: queueing only at the idle loop, the mailbox date and time,
+completion after the callback's epilogue, abandoning a callback the guest never
+runs, and the ROM guards. Build it standalone with `clang++ -std=c++20`.
+Expected: `PASS host clock queueing, completion, abandonment and rejection guards`.

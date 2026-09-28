@@ -850,6 +850,7 @@ public:
 		, m_boot_mode(*this, "BOOT_MODE")
 		, m_rtc_resume(*this, "RTC_RESUME")
 		, m_battery(*this, "BATTERY")
+		, m_host_battery(*this, "HOST_BATTERY")
 		, m_power_supply(*this, "POWER_SUPPLY")
 		, m_option_button(*this, "OPTION_BUTTON")
 		, m_pccard_battery(*this, "PCCARD%u_BATTERY", 1U)
@@ -1102,6 +1103,7 @@ private:
 	void update_phone_ring_input(bool ringing, bool signal_edge);
 	void restore_inputs();
 	u16 touch_adc_value() const;
+	bool external_power_present() const;
 	u16 main_battery_reading() const;
 	u16 backup_battery_reading() const;
 	bool magicbus_powered() const;
@@ -1186,6 +1188,7 @@ private:
 	required_ioport m_boot_mode;
 	required_ioport m_rtc_resume;
 	required_ioport m_battery;
+	required_ioport m_host_battery;
 	required_ioport m_power_supply;
 	required_ioport m_option_button;
 	required_ioport_array<2> m_pccard_battery;
@@ -2062,8 +2065,22 @@ void datarover_state::restore_inputs()
 }
 
 
+bool datarover_state::external_power_present() const
+{
+	unsigned const host = m_host_battery->read();
+	return (host & 0x7f) ? BIT(host, 7) : BIT(m_power_supply->read(), 0);
+}
+
+
 u16 datarover_state::main_battery_reading() const
 {
+	// Host percentage is transient input, not saved guest state. Zero disables
+	// mirroring; 1..101 encode 0..100% against the ROM's calibration record.
+	// Bit 7 independently mirrors the host AC adapter.
+	unsigned const host = m_host_battery->read() & 0x7f;
+	if (host)
+		return 80 + (std::min(host - 1, 100U) * 720 + 50) / 100;
+
 	// Full charge reads at the calibration record's full point, so the OS
 	// reports 100%.  "Low" sits under the 320-count warning threshold but
 	// above empty; "empty" is below the 80-count floor, which is what the OS
@@ -2081,6 +2098,9 @@ u16 datarover_state::main_battery_reading() const
 
 u16 datarover_state::backup_battery_reading() const
 {
+	if (m_host_battery->read() & 0x7f)
+		return 1000;
+
 	// The backup cell's thresholds are 400 empty, 816 low.  A healthy reading
 	// has to clear 816: the driver used to answer 340 here, below even the
 	// empty point, so every boot posted "your backup battery is almost out of
@@ -2486,7 +2506,7 @@ bool datarover_state::dino_clock_enabled(u32 mask) const
 
 bool datarover_state::main_battery_charging() const
 {
-	return BIT(m_power_supply->read(), 0)
+	return external_power_present()
 			&& !BIT(m_power_supply->read(), 1)
 			&& (m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_CHARGER_ENABLE)
 			&& main_battery_reading() < 800;
@@ -3380,7 +3400,8 @@ TIMER_CALLBACK_MEMBER(datarover_state::battery_charge_tick)
 	// simulation.  Four ADC counts per emulated second makes the gradual rise
 	// observable in the Power window and deterministic in regressions while
 	// preserving the ROM's real 80/320/800 thresholds.
-	if (main_battery_charging())
+	// Preserve the synthetic battery while the host supplies its level.
+	if (!(m_host_battery->read() & 0x7f) && main_battery_charging())
 		++m_main_battery_charge;
 }
 
@@ -3974,7 +3995,7 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 		return (m_dino[offset] & ~(DINO_POWER_ON_BUTTON_STATUS | DINO_POWER_AC_ADAPTER))
 				| DINO_POWER_OK_STATUS
 				| (m_power_button->read() ? DINO_POWER_ON_BUTTON_STATUS : 0)
-				| (BIT(m_power_supply->read(), 0) ? DINO_POWER_AC_ADAPTER : 0);
+				| (external_power_present() ? DINO_POWER_AC_ADAPTER : 0);
 
 	default:
 		return m_dino[offset];
@@ -4710,6 +4731,12 @@ static INPUT_PORTS_START(datarover840)
 	// Battery levels are what the OS samples on Betty ADC inputs 24 and 28.
 	// The defaults are healthy; the other settings exist so the low-battery
 	// paths can be exercised without waiting for a cell to run down.
+	// An analog field allows arbitrary integer overrides from the native core
+	// and Lua. This is not a persisted machine configuration choice.
+	PORT_START("HOST_BATTERY")
+	PORT_BIT(0xff, 0, IPT_PEDAL) PORT_NAME("Host battery override") PORT_CODE(INPUT_CODE_INVALID)
+	PORT_MINMAX(0, 229) PORT_SENSITIVITY(100) PORT_KEYDELTA(0)
+
 	PORT_START("BATTERY")
 	PORT_CONFNAME(0x03, 0x00, "Main battery")
 	PORT_CONFSETTING(0x00, "Full")
