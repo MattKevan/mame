@@ -74,8 +74,6 @@ void etherlink_iii_pccard_device::device_start()
 	save_item(NAME(m_receiver_enabled));
 	save_item(NAME(m_transmitter_enabled));
 	save_item(NAME(m_statistics_enabled));
-
-	set_present(true);
 }
 
 
@@ -116,6 +114,11 @@ void etherlink_iii_pccard_device::device_reset()
 	m_transmitter_enabled = false;
 	m_statistics_enabled = false;
 	set_mac(m_station_address.data());
+	// Signal card presence here rather than in device_start(): the resulting
+	// cd1/cd2 callbacks reach owning-driver logic (e.g. DataRover's
+	// PCCARD*_BATTERY ioport reads) that is only safe once ioports have
+	// finished configuration, which happens between device start and reset.
+	set_present(true);
 	update_irq();
 }
 
